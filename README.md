@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Agentic-Systems-Lab/Agentic-AutoRAG/HEAD/assets/banner.png" alt="Agentic AutoRAG">
+   <img width="3200" height="1000" alt="Image" src="https://github.com/user-attachments/assets/ca0688b7-486b-4f6c-9124-00ee83af2154" />
 </p>
 
 <p align="center">
