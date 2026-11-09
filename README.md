@@ -9,6 +9,12 @@
 
 # Agentic AutoRagline
 
+**[Explore the live research website](https://autoragline-research.vercel.app/)**
+
+Explore the interactive architecture, experimental results, searchable model
+tables, and accuracy/cost playground. The frontend is hosted on Vercel; its source
+and local setup instructions are in [research-website/](research-website/README.md).
+
 Agentic AutoRagline tunes a Retrieval-Augmented Generation (RAG) pipeline for your documents. You give it a corpus and a search space, the options it may pick from for chunking, embedding, retrieval, reranking, generation and more. It returns a recommended configuration and the Pareto frontier of configurations that trade answer accuracy against cost per query.
 
 This project is based on Agentic AutoRAG. Maintainer contact: Sagi Siddhartha (sagi15sid05@gmail.com).

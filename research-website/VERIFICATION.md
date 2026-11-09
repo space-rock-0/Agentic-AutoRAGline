@@ -23,5 +23,6 @@
 - Original bibliography and appendices are extracted text; PDF column order can create awkward line wrapping in expanded excerpts. Tables and narrative do not depend on that text ordering.
 - Native computer-use initialization failed; browser verification used Playwright/Edge instead.
 - Installation reported 7 moderate dependency advisories. The later npm audit endpoint was unavailable; a clean dependency-security audit is not claimed.
-- No production hosting deployment was performed. Build output is static `dist/`.
+- Production deployed on Vercel: https://autoragline-research.vercel.app/ . Source commit: `b69c7ff9bd7e966184d43fb1bea6364070cbc2bb`; deployment: `dpl_ArDob6uJFi1xWL8mwMXUxxCqMT4e`.
+- Live smoke verification passed: public HTTP 200, expected page title, working dataset selector and original-figure modal, zero browser console errors. The live check uses `tools/live-smoke.mjs` with the HTTPS URL.
 - Scientific diagrams and actual PDF figures take precedence over skill suggestions to generate decorative images. No generated images or invented scientific plots were used.
