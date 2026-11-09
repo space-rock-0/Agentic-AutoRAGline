@@ -111,8 +111,7 @@ Everything is written under `meta.output_dir`. The files you will read are `opti
 - [docs/custom_exam.md](docs/custom_exam.md): optimizing against your own questions.
 
 ## Benchmark
-
-Benchmark repository: [lassebaerlandstrand/Agentic-AutoRAG-Bench](https://github.com/lassebaerlandstrand/Agentic-AutoRAG-Bench)
+cd Agentic-AutoRAG-Bench-main
 
 ## License
 
