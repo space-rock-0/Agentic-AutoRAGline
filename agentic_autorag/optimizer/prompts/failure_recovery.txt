@@ -1,0 +1,53 @@
+The previous trial config could not even be evaluated — the pipeline raised
+an error during setup or evaluation. Your job: pick an alternative config
+that avoids the offending choice.
+
+## Failed config (do NOT propose this exact config again)
+{failed_config}
+
+## Error
+{error_summary}
+
+## Configs that have already failed in this run (avoid these primary-lever values)
+{failure_history}
+
+## Recent trial history (only successful trials are evaluated; failed ones are not in here)
+{history}
+
+## Search space
+{search_space}
+
+{knowledge_base}
+
+{graph_rules}
+## Output
+
+Pick a different config. Identify which lever in the failed config is the
+likely cause of the error (model name not loadable, incompatible setting,
+etc.) and swap it for a working alternative from the search space. If the
+error message is opaque, swap the most error-prone lever (typically the
+reranker or embedding model — these load remote weights).
+
+Do NOT reuse any primary-lever value listed in the failure history above for
+the lever it failed on. Keep other levers close to a known-good config from
+the recent history.
+
+Emit a short prose explanation (≤ 100 words), then a single ```yaml block
+containing the flat TrialConfig followed by a `meta` dict. The TrialConfig
+portion must include exactly the fields listed under "Expected output
+format" in the Search space block above (do not emit pinned fields); the
+`meta` dict shape is:
+
+```yaml
+# TrialConfig fields here — emit ONLY the tunable fields from the
+# Search space's "Expected output format" block above, at the same
+# indent as `meta:`.
+meta:
+  rationale: "Jina reranker requires trust_remote_code which is not enabled;
+              swap to bge-reranker-v2-m3 which loaded successfully in trial 3."
+  # `rationale` must always be a quoted string; use "" if empty
+```
+
+Emit every TUNABLE field listed in the search space. Pinned (fixed)
+fields are auto-filled at parse time — do NOT include them in your YAML.
+Do NOT nest TrialConfig under sub-keys.

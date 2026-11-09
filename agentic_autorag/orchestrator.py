@@ -1,0 +1,2404 @@
+"""Main orchestration loop: build → eval → diagnose → propose."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+import time
+from collections import Counter
+from pathlib import Path
+
+import yaml
+from docling_core.types.doc.document import DoclingDocument
+from tqdm import tqdm
+
+from agentic_autorag.config.knowledge_base import KnowledgeBase
+from agentic_autorag.config.loader import load_config
+from agentic_autorag.config.models import (
+    OpenEndedQuestion,
+    ProjectConfig,
+    TrialConfig,
+    _describe_dim,
+)
+from agentic_autorag.cost_ledger import (
+    CostBucket,
+    CostLedger,
+    get_active_ledger,
+    reset_active_ledger,
+    set_active_ledger,
+)
+from agentic_autorag.engine._io import (
+    DIRECT_READ_EXTENSIONS,
+    SKIP_FILENAMES,
+    iter_corpus_files,
+    load_direct_read_corpus,
+)
+from agentic_autorag.engine.corpus_cleaner import (
+    DuplicateClusters,
+    detect_near_duplicates,
+)
+from agentic_autorag.engine.corpus_sampler import sample_corpus
+from agentic_autorag.engine.graph_store import LightRAGStore
+from agentic_autorag.engine.index_builder import IndexBuilder, IngredientCache, RAGIndex
+from agentic_autorag.engine.parsers import build_parser
+from agentic_autorag.engine.pipeline import RAGPipeline
+from agentic_autorag.engine.section_classifier import SectionLabel
+from agentic_autorag.engine.vllm_server import VLLMServerManager
+from agentic_autorag.examiner._errors import (
+    AllQuestionsErrored,
+    ExamGenerationFailed,
+    InsufficientTrialCoverage,
+)
+from agentic_autorag.examiner.custom_exam import load_custom_exam
+from agentic_autorag.examiner.evaluator import ExamResult, OpenEndedEvaluator
+from agentic_autorag.examiner.exam_agent import ExamAgent, dl_doc_to_chunk_text, dl_doc_to_index_text
+from agentic_autorag.examiner.exam_validator import run_validation_pipeline
+from agentic_autorag.examiner.probe_selector import (
+    attach_probe_metadata,
+    collect_probe_outcomes,
+    rank_models_for_probes,
+    select_exam,
+    select_probe_configs,
+)
+from agentic_autorag.litellm_runtime import install_model_aliases
+from agentic_autorag.optimizer import pareto
+from agentic_autorag.optimizer.diagnosis import ProposalMeta, Strategy
+from agentic_autorag.optimizer.history import HistoryLog, TrialRecord
+from agentic_autorag.optimizer.reasoning_agent import ReasoningAgent
+from agentic_autorag.optimizer.state import CONFIG_LEVER_FIELDS, build_failure_cross_tab
+from agentic_autorag.optimizer.verify_models import (
+    assert_all_ok,
+    verify_llm_endpoints,
+)
+from agentic_autorag.output_layout import RUN_LOG_FILE, RunLayout
+
+
+def _format_per_stage_llm(config: TrialConfig) -> str:
+    """Render per-stage LLM picks compactly. Collapses to a single value when
+    every active stage uses the same LLM."""
+    parts: dict[str, str | None] = {
+        "gen": config.generator_llm,
+        "comp": config.compressor_llm,
+        "exp": config.expander_llm,
+    }
+    active = [v for v in parts.values() if v is not None]
+    if active and all(v == active[0] for v in active):
+        return active[0]
+    return "|".join(f"{k}:{v if v is not None else 'null'}" for k, v in parts.items())
+
+
+logger = logging.getLogger(__name__)
+
+# Fraction of the requested exam_size below which exam generation is treated
+# as a fatal failure. Anything smaller would force the optimizer to spend
+# trials judging an exam that doesn't span enough difficulty to discriminate.
+MIN_EXAM_FRACTION = 0.5
+
+# Fraction of a trial's exam questions that must be evaluable (n_valid /
+# n_total) for its score to be trusted. Below this the trial is routed to
+# failure-recovery instead of scored: errored questions are excluded rather
+# than scored wrong, so a low-coverage trial can inflate toward 1.0 over its
+# few survivors and lure the optimizer into selecting a rate-limited or
+# unavailable generator. Mirrors MIN_EXAM_FRACTION.
+MIN_TRIAL_COVERAGE_FRACTION = 0.5
+
+# CostBucket fields replayed when crediting a cached exam's recorded
+# generation cost to the active ledger. ``n_calls`` is excluded because the
+# replay is one logical call regardless of how many original calls the
+# generation issued.
+_REPLAYABLE_BUCKET_FIELDS = (
+    "usd",
+    "prompt_tokens",
+    "completion_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+    "embedding_input_tokens",
+)
+
+
+def _exam_gen_bucket_snapshot() -> dict:
+    """Return current ``exam_generation`` bucket totals as a plain dict (zeros if absent)."""
+    ledger = get_active_ledger()
+    if ledger is None:
+        return {k: 0 for k in _REPLAYABLE_BUCKET_FIELDS}
+    bucket = ledger.buckets.get("exam_generation")
+    if bucket is None:
+        return {k: 0 for k in _REPLAYABLE_BUCKET_FIELDS}
+    return {k: getattr(bucket, k) for k in _REPLAYABLE_BUCKET_FIELDS}
+
+
+def _exam_cache_key(exam_path: Path) -> str:
+    """Content-hashed cache key so two machines loading the same cached exam
+    log identical keys."""
+    try:
+        digest = hashlib.sha256(exam_path.read_bytes()).hexdigest()[:16]
+        return f"exam_{digest}"
+    except OSError:
+        return "exam_unreadable"
+
+
+def _check_trial_coverage(result: ExamResult) -> None:
+    """Raise if too few of a trial's questions were evaluable to trust its score.
+
+    ``AllQuestionsErrored`` when nothing was evaluable (n_valid == 0);
+    ``InsufficientTrialCoverage`` when a nonzero n_valid is still below
+    ``MIN_TRIAL_COVERAGE_FRACTION`` of n_total. Both are caught by the run
+    loop's recovery branch, so a low-coverage trial is re-proposed rather than
+    scored on its inflated surviving subset.
+    """
+    if result.all_errored:
+        raise AllQuestionsErrored(result.error_sentinel, result.n_total)
+    if result.n_valid < MIN_TRIAL_COVERAGE_FRACTION * result.n_total:
+        raise InsufficientTrialCoverage(result.n_valid, result.n_total)
+
+
+# Provider prefix → list of alternative auth methods.
+# Each inner list is a set of env vars that together satisfy auth.
+# The provider passes if ANY one alternative is fully present.
+# The first alternative is shown to the user in error messages.
+_PROVIDER_ENV_VARS: dict[str, list[list[str]]] = {
+    "gemini": [["GEMINI_API_KEY"]],
+    "openai": [["OPENAI_API_KEY"]],
+    "anthropic": [["ANTHROPIC_API_KEY"]],
+    "cohere": [["COHERE_API_KEY"]],
+    "mistral": [["MISTRAL_API_KEY"]],
+    "vertex_ai": [
+        ["VERTEXAI_PROJECT", "VERTEXAI_LOCATION"],
+    ],
+    "bedrock": [
+        ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION_NAME"],
+        ["AWS_PROFILE", "AWS_REGION_NAME"],
+        ["AWS_REGION_NAME"],
+    ],
+    "azure": [["AZURE_API_KEY", "AZURE_API_BASE"]],
+    "azure_ai": [["AZURE_AI_API_KEY", "AZURE_AI_API_BASE"]],
+}
+
+
+def _check_api_keys(config: ProjectConfig) -> None:
+    """Verify required env vars are set for configured providers. Each provider
+    can satisfy auth via any one of multiple alternative env-var sets (e.g.
+    Bedrock accepts explicit keys, named profile, or IAM)."""
+    missing: list[tuple[str, list[str]]] = []
+
+    models_to_check: list[str] = []
+    models_to_check.extend(config.search_space.all_llm_models())
+    models_to_check.append(config.agent.optimizer_model)
+    models_to_check.append(config.agent.examiner_model)
+    if config.graph is not None:
+        models_to_check.append(config.graph.extraction_model)
+
+    checked_prefixes: set[str] = set()
+
+    models_to_check = [config.resolve_alias(m) for m in models_to_check]
+
+    for model_str in models_to_check:
+        if "/" not in model_str:
+            continue
+        provider_prefix = model_str.split("/")[0]
+
+        if provider_prefix in ("ollama", "sentence-transformers", "hosted_vllm"):
+            continue
+        if provider_prefix in checked_prefixes:
+            continue
+        if provider_prefix not in _PROVIDER_ENV_VARS:
+            continue
+
+        checked_prefixes.add(provider_prefix)
+        auth_alternatives = _PROVIDER_ENV_VARS[provider_prefix]
+
+        provider_ok = any(all(os.getenv(var) for var in required_set) for required_set in auth_alternatives)
+
+        if not provider_ok:
+            primary_set = auth_alternatives[0]
+            missing_vars = [v for v in primary_set if not os.getenv(v)]
+            missing.append((model_str, missing_vars))
+
+    if missing:
+        lines = ["Missing environment variables for configured models:"]
+        for model_str, vars_list in missing:
+            vars_str = ", ".join(vars_list)
+            lines.append(f"  {model_str:<45} →  set {vars_str}")
+        lines.append("")
+        lines.append("See .env.example for all supported providers and auth methods.")
+        raise OSError("\n".join(lines))
+
+
+class Orchestrator:
+    """Main optimization loop that ties all components together."""
+
+    def __init__(
+        self,
+        config_path: str,
+        output_dir_override: str | None = None,
+        debug_eval_samples: int = 0,
+        seed: int | None = None,
+        force_verify: bool = False,
+        resume: bool = False,
+        skip_final_report: bool = False,
+        use_knowledge_base: bool = True,
+        use_diagnosis: bool = True,
+        compact_history: bool = False,
+    ) -> None:
+        self.config: ProjectConfig = load_config(config_path)
+        install_model_aliases(self.config.model_aliases)
+        _check_api_keys(self.config)
+        self.seed = seed
+        self._force_verify = force_verify
+        self.resume = resume
+        self.skip_final_report = skip_final_report
+        meta = self.config.meta
+
+        # Cache dir always tracks meta.output_dir from YAML — the shared root
+        # for parsed-corpus, exam, ingredient, and graph caches. Baseline
+        # drivers pass ``output_dir_override`` to keep per-run artifacts out
+        # of the agentic optimize run's directory while sharing the cache.
+        self._cache_dir = Path(meta.output_dir)
+        self._cache_dir.mkdir(parents=True, exist_ok=True)
+
+        self.output_dir = Path(output_dir_override) if output_dir_override else self._cache_dir
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.logger = self._setup_logger(self.output_dir)
+
+        # History is cleared in run() so baseline drivers can construct an
+        # Orchestrator without wiping a sibling agentic run's history.jsonl.
+        # When ``resume=True``, prior records are rehydrated and ``run()``
+        # skips the clear so the trial loop picks up at trial K+1.
+        self.history = HistoryLog(
+            path=str(RunLayout(base=self.output_dir).history),
+            load_existing=resume,
+        )
+
+        # ``use_knowledge_base=False`` is the KB-off ablation: the agent reasons
+        # without the model-ranking/pricing knowledge base (cold reasoning). The
+        # KB is still loaded for embedding token limits below — those are a
+        # search-space-validity input, not a reasoning prior — but the agent
+        # receives ``knowledge_base=None``.
+        try:
+            kb: KnowledgeBase | None = KnowledgeBase()
+        except Exception as e:
+            logger.warning("Could not load knowledge base: %s. Agent will run without model context.", e)
+            kb = None
+
+        # Populate embedding token limits from KB for cross-field validation
+        if kb:
+            embed_models = kb._embeddings.get("models", {})
+            for name in self.config.search_space.embedding.models:
+                entry = embed_models.get(name)
+                if entry and entry.get("max_tokens"):
+                    self.config.embedding_token_limits[name] = int(entry["max_tokens"])
+
+        self.knowledge_base: KnowledgeBase | None = kb if use_knowledge_base else None
+        self.agent = ReasoningAgent(
+            agent_model=self.config.agent.optimizer_model,
+            config=self.config,
+            history=self.history,
+            knowledge_base=self.knowledge_base,
+            seed=seed,
+            use_diagnosis=use_diagnosis,
+            compact_history=compact_history,
+        )
+        # Trial-time judge uses the explicitly-configured judge model; the
+        # oracle gate overwrites ``evaluator.judge_model`` with the same value
+        # in ``_generate_exam``.
+        trial_judge_model = self.config.agent.judge_model
+        self.evaluator = OpenEndedEvaluator(
+            concurrency=self.config.agent.concurrency,
+            judge_model=trial_judge_model,
+            chunk_relevance_min_overlap_chars=self.config.examiner.chunk_relevance_min_overlap_chars,
+            chunk_relevance_ngram_size=self.config.examiner.chunk_relevance_ngram_size,
+            chunk_relevance_overlap_threshold=self.config.examiner.chunk_relevance_overlap_threshold,
+            chunk_relevance_min_run=self.config.examiner.chunk_relevance_min_run,
+            debug_eval_samples=debug_eval_samples,
+        )
+
+        parsing = self.config.parsing
+        self.parser = build_parser(
+            ocr=parsing.ocr,
+            table_structure=parsing.table_structure,
+        )
+
+        self.ingredient_cache = IngredientCache(
+            cache_dir=self.cache_dir / ".cache" / "ingredients",
+            max_bytes=int(meta.cache_max_gb * 1024**3),
+        )
+        self.index_builder = IndexBuilder(cache=self.ingredient_cache)
+
+        self.graph_store: LightRAGStore | None = None
+        if self.config.graph is not None:
+            self.graph_store = LightRAGStore(
+                working_dir=self.cache_dir / "lightrag",
+                build_config=self.config.graph,
+            )
+
+        # vLLM server is auto-managed when any hosted_vllm/ model appears in
+        # the search space or as the graph extraction model.
+        has_vllm_in_search = any(m.startswith("hosted_vllm/") for m in self.config.search_space.all_llm_models())
+        has_vllm_in_graph = self.config.graph is not None and self.config.graph.extraction_model.startswith(
+            "hosted_vllm/"
+        )
+        self.vllm_manager: VLLMServerManager | None = None
+        if has_vllm_in_search or has_vllm_in_graph:
+            self.vllm_manager = VLLMServerManager(self.config.vllm, self.output_dir)
+
+        # Setup state — populated lazily by setup(), reused across evaluate_trial() calls.
+        # Lets baseline drivers reuse the same parsed corpus, graph, and exam without
+        # rebuilding everything from scratch.
+        self._setup_done: bool = False
+        self._documents: list[str] | None = None
+        self._doc_ids: list[str] | None = None
+        self._exam: list[OpenEndedQuestion] | None = None
+
+        # First-use-per-(method, seed) cache-credit bookkeeping. Each Orchestrator
+        # instance is the lifetime of one (method, seed) run, so a per-instance
+        # set is the right scope: the first time this run encounters an
+        # ``emb_fp``, we credit the deterministic embedding token count to the
+        # ``embedding_build`` cost bucket; subsequent encounters credit nothing.
+        self._seen_emb_fps: set[str] = set()
+        # Pending cache events to flush to ``cache_events.jsonl``. Each event
+        # carries its own ``phase`` tag ("exam_gen" or "trial") set at queue
+        # time so the audit log honestly attributes probe-phase builds — they
+        # are flushed at the end of ``_load_or_generate_exam`` with no trial
+        # number, not lumped into trial 1.
+        self._pending_cache_events: list[dict] = []
+        # Current pipeline phase, used to tag pending cache events at queue
+        # time. Flipped to "exam_gen" inside ``_load_or_generate_exam`` and
+        # to "trial" at the top of each trial-loop iteration.
+        self._current_phase: str = "setup"
+        # Near-duplicate clusters: metadata only, never used to filter the
+        # corpus that per-trial IndexBuilder.build sees.
+        self._duplicate_clusters: DuplicateClusters | None = None
+
+    @property
+    def cache_dir(self) -> Path:
+        """Shared cache root. Falls back to ``output_dir`` for tests that bypass ``__init__``."""
+        return getattr(self, "_cache_dir", None) or self.output_dir
+
+    @property
+    def out_layout(self) -> RunLayout:
+        """Result-artifact paths, rooted at ``output_dir``. Derived on access so
+        tests that reassign ``output_dir`` after construction stay correct."""
+        return RunLayout(base=self.output_dir)
+
+    @property
+    def cache_layout(self) -> RunLayout:
+        """Exam-cache-artifact paths, rooted at ``cache_dir``."""
+        return RunLayout(base=self.cache_dir)
+
+    @property
+    def documents(self) -> list[str]:
+        if self._documents is None:
+            raise RuntimeError("Orchestrator.setup() must be called before accessing documents")
+        return self._documents
+
+    @property
+    def doc_ids(self) -> list[str]:
+        if self._doc_ids is None:
+            raise RuntimeError("Orchestrator.setup() must be called before accessing doc_ids")
+        return self._doc_ids
+
+    @property
+    def exam(self) -> list[OpenEndedQuestion]:
+        if self._exam is None:
+            raise RuntimeError("Orchestrator.setup() must be called before accessing exam")
+        return self._exam
+
+    @staticmethod
+    def _truncate_list(items: list[str], limit: int = 5) -> str:
+        """Join items with commas, adding '... +N more' when truncated."""
+        if len(items) <= limit:
+            return ", ".join(items)
+        shown = ", ".join(items[:limit])
+        return f"{shown} (+{len(items) - limit} more)"
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        """Human-readable duration: '45s', '7m 30s', '1h 05m'."""
+        seconds = max(0.0, seconds)
+        if seconds < 60:
+            return f"{seconds:.0f}s"
+        minutes, secs = divmod(int(seconds), 60)
+        if minutes < 60:
+            return f"{minutes}m {secs:02d}s"
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours}h {minutes:02d}m"
+
+    def _log_config_overview(self) -> None:
+        """Log a summary of the project config and search space at startup."""
+        meta = self.config.meta
+        ss = self.config.search_space
+        examiner = self.config.examiner
+        agent = self.config.agent
+
+        self.logger.info(
+            "Project: %s | max_trials=%d | exam_size=%d",
+            meta.project_name,
+            meta.max_trials,
+            examiner.exam_size,
+        )
+        self.logger.info("Optimizer model: %s", agent.optimizer_model)
+        self.logger.info("Examiner model: %s", agent.examiner_model)
+        all_llms = ss.all_llm_models()
+        self.logger.info(
+            "Search space: %d LLM(s), %d embedding(s), %d reranker(s), %d index type(s)",
+            len(all_llms),
+            len(ss.embedding.models),
+            len(ss.reranker.models),
+            len(ss.retrieval.index_types),
+        )
+        self.logger.info("  LLMs (generator): %s", self._truncate_list(ss.generator.models))
+        self.logger.info("  LLMs (expander):  %s", self._truncate_list(ss.query_expansion.models))
+        self.logger.info("  LLMs (compressor):%s", self._truncate_list(ss.passage_compressor.models))
+        self.logger.info("  Embeddings: %s", self._truncate_list(ss.embedding.models))
+        self.logger.info("  Rerankers: %s", self._truncate_list(ss.reranker.models))
+        self.logger.info("  Index types: %s", self._truncate_list([it.value for it in ss.retrieval.index_types]))
+        self.logger.info(
+            "  Chunking: %s | size %s | overlap %s",
+            self._truncate_list(ss.chunking.strategies),
+            _describe_dim(ss.chunking.chunk_token_size, integer=True),
+            _describe_dim(ss.chunking.chunk_token_overlap, integer=True),
+        )
+
+    async def setup(self) -> None:
+        """Idempotent: parse corpus, build graph (once), generate or load exam.
+        Populates instance state shared with ``evaluate_trial``. Safe to call
+        multiple times; baseline drivers call it before their proposal loop
+        to share the corpus, graph, and exam with the agentic ``run()``."""
+        if self._setup_done:
+            return
+
+        meta = self.config.meta
+        self._log_config_overview()
+
+        # 1. Parse corpus
+        self.logger.info("Loading corpus from %s", meta.corpus_path)
+        t0 = time.monotonic()
+        parsed = self._load_and_parse_corpus()
+        self.logger.info("Loaded %d document(s) in %.2fs", len(parsed), time.monotonic() - t0)
+        if not parsed:
+            raise RuntimeError(f"No documents found in {meta.corpus_path}")
+        dl_doc_ids = [name for name, _ in parsed]
+        dl_documents = [dl_doc for _, dl_doc in parsed]
+        max_chunk_words = self.config.examiner.max_chunk_words
+
+        # Retrieval-scoring index corpus, decoupled from the Docling composition
+        # frame. It must cover the full deployed doc-id universe the held-out gold
+        # is defined over, embed headings (high-signal retrieval terms the body
+        # often refers to only by pronoun), and match the held-out loader exactly.
+        # For .md/.txt that is the shared raw loader (every doc, headings inline,
+        # identical order to held-out); for parsed (PDF) corpora it is the
+        # contextualized Docling text (heading path prepended). The body-only
+        # Docling text stays the composition / span-verification frame inside
+        # _generate_exam. Set before exam generation so probe indexes — like the
+        # per-trial and held-out indexes — score on this same corpus.
+        if self._is_direct_read_corpus():
+            self._doc_ids, self._documents = load_direct_read_corpus(Path(meta.corpus_path))
+        else:
+            self._doc_ids = dl_doc_ids
+            self._documents = [dl_doc_to_index_text(dl_doc, max_chunk_words=max_chunk_words) for dl_doc in dl_documents]
+
+        # The evaluator's chunk-relevance matcher and near-duplicate detection
+        # operate on the index corpus so they share the retrieval coordinate frame.
+        self.evaluator.documents = dict(zip(self._doc_ids, self._documents, strict=True))
+        self._duplicate_clusters = self._detect_or_load_duplicates(self._documents, self._doc_ids)
+        self.evaluator.duplicate_alias_map = dict(self._duplicate_clusters.alias_to_canonical)
+
+        # 2. Build graph index (once, if graph is configured)
+        if self.graph_store is not None:
+            self.logger.info("Initialising LightRAG graph store")
+            t0 = time.monotonic()
+            corpus_hash = self._corpus_cache_key()
+            # Check cache state BEFORE touching vLLM — a cached graph skips the
+            # build entirely and never calls extraction_model, so there's no
+            # reason to spin up the server.
+            graph_already_built = self.graph_store.is_built(corpus_hash)
+            extraction_model = self.config.graph.extraction_model  # type: ignore[union-attr]
+            if not graph_already_built and self.vllm_manager and extraction_model.startswith("hosted_vllm/"):
+                self.logger.info("Starting vLLM for graph extraction model: %s", extraction_model)
+                await self.vllm_manager.ensure_model(extraction_model)
+            await self.graph_store.initialize(corpus_hash)
+            if graph_already_built:
+                self.logger.info("Loaded existing LightRAG graph in %.2fs", time.monotonic() - t0)
+            else:
+                self.logger.info("Building LightRAG knowledge graph (resumable, cached across runs)")
+                await self.graph_store.build(self._documents, corpus_hash)
+                self.logger.info("Graph build complete in %.2fs", time.monotonic() - t0)
+
+        # 3. Load a custom exam if configured, else generate (or load from cache)
+        custom_exam_path = self.config.examiner.custom_exam_path
+        if custom_exam_path is not None:
+            # An externally-produced exam (benchmark validation exam, user-supplied,
+            # exported) enters through this one door. Generation, save, and the
+            # exam-cost replay are all skipped: an outside exam has zero
+            # generation cost and must not clobber the shared cache. This also
+            # structurally avoids the _replay_exam_cost landmine (no missing
+            # exam_cost.json can raise because we never touch the cache path).
+            self.logger.info("Loading custom exam from %s", custom_exam_path)
+            t0 = time.monotonic()
+            exam = load_custom_exam(Path(custom_exam_path))
+            self.logger.info(
+                "Loaded %d custom questions in %.2fs (generation + save skipped)",
+                len(exam),
+                time.monotonic() - t0,
+            )
+        else:
+            self.logger.info("Generating/loading open-ended 2-hop exam")
+            t0 = time.monotonic()
+            exam, from_cache = await self._generate_exam(
+                dl_documents,
+                doc_ids=dl_doc_ids,
+                knowledge_base=self.knowledge_base,
+                optimizer_model=self.config.agent.optimizer_model,
+                index_documents=self._documents,
+                index_doc_ids=self._doc_ids,
+            )
+            self._save_exam(exam)
+            if from_cache:
+                self.logger.info("Loaded %d questions in %.2fs", len(exam), time.monotonic() - t0)
+            else:
+                self.logger.info("Generated %d questions in %.2fs", len(exam), time.monotonic() - t0)
+            self.logger.info("Saved exam to %s", self.cache_layout.exam)
+
+        self._exam = exam
+        self._setup_done = True
+
+    async def evaluate_trial(self, trial_config: TrialConfig) -> ExamResult:
+        """Build/load index → ensure vLLM → run pipeline → score the exam.
+        Requires ``setup()``. Returns an ``ExamResult`` from
+        ``OpenEndedEvaluator.evaluate``."""
+        if not self._setup_done:
+            raise RuntimeError("Orchestrator.setup() must be called before evaluate_trial()")
+        documents = self._documents
+        doc_ids = self._doc_ids
+        exam = self._exam
+        assert documents is not None and doc_ids is not None and exam is not None
+
+        # a. Build or load index (ingredient caching is internal to IndexBuilder)
+        structural = trial_config.to_structural()
+        corpus_hash = self._corpus_cache_key()
+        chunks_fp = structural.chunks_fingerprint(corpus_hash, doc_ids)
+        emb_fp = structural.embeddings_fingerprint(corpus_hash, doc_ids)
+
+        t0 = time.monotonic()
+        if self.ingredient_cache.has_embeddings(emb_fp):
+            index_source = "cache hit (full)"
+        elif self.ingredient_cache.has_chunks(chunks_fp):
+            index_source = "cache hit (chunks, re-embed)"
+        else:
+            index_source = "build"
+        self.logger.info(
+            "Index %s %s (embed=%s, chunk=%d, overlap=%d, strategy=%s)",
+            emb_fp,
+            index_source,
+            trial_config.embedding_model,
+            trial_config.chunk_token_size,
+            trial_config.chunk_token_overlap,
+            trial_config.chunking_strategy,
+        )
+        if index_source == "cache hit (full)":
+            self.logger.info("Rebuilding in-memory LanceDB table from cached ingredients...")
+        index = await self.index_builder.build(
+            documents,
+            structural,
+            corpus_hash=corpus_hash,
+            doc_ids=doc_ids,
+        )
+        self._credit_embedding_build(index)
+        index.graph_store = self.graph_store
+        index_elapsed = time.monotonic() - t0
+        self.logger.info(
+            "Index ready in %.2fs (%d chunks, %s)",
+            index_elapsed,
+            len(index.chunks),
+            index_source,
+        )
+
+        # b. Ensure vLLM is serving every per-stage model this trial needs.
+        # vLLM only hosts one model at a time, so all hosted_vllm/ models in
+        # this trial must match — enforced inside ensure_model().
+        if self.vllm_manager:
+            for stage_model in (
+                trial_config.generator_llm,
+                trial_config.compressor_llm,
+                trial_config.expander_llm,
+            ):
+                if stage_model and stage_model.startswith("hosted_vllm/"):
+                    await self.vllm_manager.ensure_model(stage_model)
+
+        # c. Construct pipeline
+        embedder = self.index_builder.get_embedder(trial_config.embedding_model)
+        cross_encoder = (
+            self.index_builder.get_cross_encoder(trial_config.reranker)
+            if trial_config.reranker and trial_config.reranker != "none"
+            else None
+        )
+        pipeline = RAGPipeline(
+            vector_store=index.vector_store,
+            graph_store=index.graph_store,
+            config=trial_config.to_runtime(
+                reasoning_effort=self.config.search_space.generator.reasoning_effort,
+            ),
+            embedder=embedder,
+            index_type=trial_config.index_type,
+            cross_encoder=cross_encoder,
+        )
+
+        # d. Evaluate
+        self.logger.info("Evaluating %d questions", len(exam))
+        t0 = time.monotonic()
+        result: ExamResult = await self.evaluator.evaluate(pipeline, exam)
+        score_elapsed = time.monotonic() - t0
+        self.logger.info("Trial scored in %.2fs", score_elapsed)
+        return result
+
+    async def cleanup(self) -> None:
+        """Release resources (graph store, vLLM). Safe to call multiple times."""
+        if self.graph_store is not None:
+            await self.graph_store.close()
+        if self.vllm_manager is not None:
+            await self.vllm_manager.shutdown()
+
+    async def run(self) -> TrialRecord:
+        """Run the full optimization loop and return the best trial."""
+        t_start = time.monotonic()
+        meta = self.config.meta
+
+        # Smoke-test every LLM endpoint in the search space before any indexing
+        # work. Catches credential/region failures up-front instead of mid-trial.
+        await self._verify_search_space_llms()
+
+        # Fresh history.jsonl for each agentic run. Baseline drivers manage their
+        # own HistoryLog and never touch this one. On resume the prior history
+        # was already loaded in ``__init__`` and must NOT be wiped — the trial
+        # loop picks up after the last loaded record.
+        if not self.resume:
+            self.history.clear()
+
+        ledger = CostLedger()
+        ledger_token = set_active_ledger(ledger)
+        try:
+            return await self._run_with_ledger(t_start, meta, ledger)
+        finally:
+            reset_active_ledger(ledger_token)
+            self._report_cost_breakdown(ledger)
+
+    async def _verify_search_space_llms(self) -> None:
+        """Ping every generator/expander/compressor model + agent/examiner/judge.
+
+        Reuses the global verification cache so a sibling bench run in the
+        same session only pays the ping cost once across methods.
+        """
+        ss = self.config.search_space
+        models: list[str] = list(ss.all_llm_models())
+        models.append(self.config.agent.optimizer_model)
+        models.append(self.config.agent.examiner_model)
+        models.append(self.config.agent.judge_model)
+        models = [self.config.resolve_alias(m) for m in models]
+
+        results = await verify_llm_endpoints(models, force=self._force_verify, logger_=self.logger)
+        assert_all_ok(results)
+
+    async def _run_with_ledger(self, t_start: float, meta, ledger: CostLedger) -> TrialRecord:
+        await self.setup()
+        exam = self.exam
+
+        n_resumed = len(self.history.records) if self.resume else 0
+        active_strategy: Strategy | None
+        best: TrialRecord | None
+        failure_history: list[tuple[TrialConfig, str]]
+        cumulative_cost_usd: float
+        prev_frontier_trials: set[int]
+        pending_meta: ProposalMeta | None
+        current_config: TrialConfig
+
+        if n_resumed > 0:
+            # Resume path: replay prior cost totals into the fresh ledger
+            # (so cost_breakdown.json ends up cumulative), repopulate the
+            # embedding-build credit set so we don't double-charge the first
+            # post-resume encounter of an embedder we already paid for, and
+            # re-run the proposer for trial K+1 using the last loaded record.
+            # The re-proposer call's cost lands in trial K+1's per-trial
+            # bucket — same semantics as ``propose_initial`` for a fresh run.
+            self._replay_prior_costs(ledger)
+            self._repopulate_seen_emb_fps_from_history()
+            last_record = self.history.records[-1]
+            cumulative_cost_usd = sum(r.total_llm_cost_usd for r in self.history.records)
+            best = self.history.get_best()
+            prev_frontier_trials = {int(r.trial_number) for r in self.history.records if r.is_pareto_optimal}
+            failure_history = []
+            active_strategy = self._recover_active_strategy(last_record)
+            self._current_phase = "trial"
+            initial_proposer_snapshot = ledger.snapshot()
+            self.logger.info(
+                "Resuming: %d trial(s) loaded; re-proposing config for trial %d",
+                n_resumed,
+                n_resumed + 1,
+            )
+            last_result = self._exam_result_from_record(last_record)
+            t0 = time.monotonic()
+            (
+                _trial_metrics,
+                _diagnosis,
+                current_config,
+                pending_meta,
+            ) = await self._propose_next_config_with_retries(
+                last_result,
+                exam,
+                last_record.config,
+                trial_number=n_resumed,
+                trials_remaining=meta.max_trials - n_resumed,
+                previous_strategy=active_strategy,
+            )
+            self.logger.info("Resumed proposer returned in %.2fs", time.monotonic() - t0)
+            if pending_meta is not None and pending_meta.strategy is not None:
+                active_strategy = pending_meta.strategy
+        else:
+            # Fresh-run path: agent proposes initial config. Snapshot the
+            # ledger BEFORE this call and pre-set the phase tag so the
+            # Initial Proposer's LLM spend lands in trial 1's per-trial delta
+            # (instead of escaping into the unattributed gap between exam-gen
+            # and the trial loop). Matches the semantic that every later
+            # trial N's bucket includes the Proposer call that produced
+            # trial N's config.
+            self._current_phase = "trial"
+            initial_proposer_snapshot = ledger.snapshot()
+            self.logger.info("Agent proposing initial configuration")
+            t0 = time.monotonic()
+            current_config = await self.agent.propose_initial(
+                corpus_description=meta.corpus_description,
+            )
+            self.logger.info("Initial config received in %.2fs", time.monotonic() - t0)
+
+            # Seed the agent's campaign plan. The agent owns plan/notes from
+            # trial 2 on. The orchestrator preserves this object across trials
+            # and threads it back as ``previous_strategy`` on every
+            # ``analyze_and_propose`` call.
+            active_strategy = Strategy()
+            best = None
+            # (config, error_message) pairs for trials that failed before
+            # producing a result. Surfaced to the agent on the next propose
+            # call so it picks an alternative instead of retrying the same
+            # broken config.
+            failure_history = []
+            cumulative_cost_usd = 0.0
+            prev_frontier_trials = set()
+            # Meta describing the Proposer call that produced the upcoming
+            # trial's config. Carried across iterations so it attaches to
+            # the TrialRecord of the trial it actually selected, not the one
+            # that ran before it. The initial trial has no preceding Proposer
+            # call, so it stays None.
+            pending_meta = None
+
+        # Per-trial trend state for the live status cards. ``prev_*`` track the
+        # most recent *scored* trial so each card can show a score/cost delta;
+        # ``trial_durations`` feeds the ETA shown at each trial header (every
+        # iteration contributes, success or failure). Seeded from history on
+        # resume so the first post-resume card still has a baseline to diff.
+        prev_score: float | None = None
+        prev_cost: float | None = None
+        prev_trial_num: int | None = None
+        trial_durations: list[float] = []
+        if n_resumed > 0 and self.history.records:
+            _last = self.history.records[-1]
+            prev_score = _last.answer_accuracy
+            prev_cost = _last.mean_llm_cost_per_query_usd
+            prev_trial_num = _last.trial_number
+
+        start_trial = n_resumed + 1
+        for trial_num in range(start_trial, meta.max_trials + 1):
+            self._current_phase = "trial"
+            trial_start = time.monotonic()
+            # ``start_trial`` reuses the pre-proposer snapshot so the (initial
+            # or resumed) Proposer's tokens roll into that trial's bucket;
+            # later trials snapshot at the loop top (Proposer-of-N +
+            # Diagnoser-of-N already ran inside trial N-1's iteration body).
+            trial_ledger_before = initial_proposer_snapshot if trial_num == start_trial else ledger.snapshot()
+            self.logger.info("%s", "=" * 60)
+            if trial_durations:
+                avg_trial_s = sum(trial_durations) / len(trial_durations)
+                eta_s = avg_trial_s * (meta.max_trials - trial_num + 1)
+                self.logger.info(
+                    "TRIAL %d/%d  ·  avg %s/trial  ·  ETA ~%s",
+                    trial_num,
+                    meta.max_trials,
+                    self._format_duration(avg_trial_s),
+                    self._format_duration(eta_s),
+                )
+            else:
+                self.logger.info("TRIAL %d/%d", trial_num, meta.max_trials)
+            self.logger.info("%s", "=" * 60)
+            self._log_config_summary("Config", current_config)
+
+            # ``delta_written`` ensures the per-trial ledger line is appended
+            # exactly once per iteration. The success path calls
+            # ``_finalize_trial_accounting`` to get the totals it needs for
+            # ``TrialRecord``; the ``finally`` only fires on failure so the
+            # spend incurred by a failed trial still appears in
+            # ``trial_cost_ledger.jsonl`` (status="failed") instead of leaking
+            # into the next trial's delta.
+            delta_written = False
+            skip_success_path = False
+            try:
+                try:
+                    result = await self.evaluate_trial(current_config)
+                    _check_trial_coverage(result)
+                except Exception as exc:
+                    error_summary = f"{type(exc).__name__}: {exc}"
+                    self.logger.exception("Trial %d evaluation failed; recovering", trial_num)
+                    failure_history.append((current_config, error_summary))
+                    skip_success_path = True
+                    if trial_num == meta.max_trials:
+                        self.logger.warning("Last trial failed; no further recovery possible")
+                    else:
+                        try:
+                            next_config, recovery_meta = await self.agent.propose_after_failure(
+                                failed_config=current_config,
+                                error_summary=error_summary,
+                                failure_history=failure_history,
+                            )
+                            recovery_changes = [
+                                f"{name}: {old_val} → {new_val}"
+                                for name, old_val, new_val in self._diff_pairs(current_config, next_config)
+                                if old_val != new_val
+                            ]
+                            self.logger.info(
+                                "Failure-recovery: %s",
+                                "; ".join(recovery_changes) if recovery_changes else "(no levers changed)",
+                            )
+                            self._log_config_diff(current_config, next_config)
+                            current_config = next_config
+                            pending_meta = recovery_meta
+                        except Exception:
+                            self.logger.exception("Failure-recovery proposal failed; reusing current config")
+
+                if not skip_success_path:
+                    # Agent analyzes failures and proposes next config.
+                    # Must happen BEFORE history.add(), which clears context/response
+                    # fields in-place to save RAM (shared object references).
+                    reasoning_elapsed = 0.0
+                    trial_config = current_config
+                    trial_metrics = None
+                    diagnosis = None
+                    proposal_meta: ProposalMeta | None = None
+                    if trial_num < meta.max_trials:
+                        self.logger.info("Agent diagnosing and proposing next config")
+                        t0 = time.monotonic()
+                        try:
+                            (
+                                trial_metrics,
+                                diagnosis,
+                                next_config,
+                                proposal_meta,
+                            ) = await self._propose_next_config_with_retries(
+                                result,
+                                exam,
+                                current_config,
+                                trial_number=trial_num,
+                                trials_remaining=meta.max_trials - trial_num,
+                                previous_strategy=active_strategy,
+                            )
+                            reasoning_elapsed = time.monotonic() - t0
+                            self._log_config_diff(current_config, next_config)
+                            current_config = next_config
+                            # Persist the agent's record-side meta with the previous strategy
+                            # carried over when the agent didn't manage to emit one (the
+                            # agent-failure fallback returns proposal_meta=None).
+                            if proposal_meta is not None and proposal_meta.strategy is not None:
+                                active_strategy = proposal_meta.strategy
+                        except Exception:
+                            reasoning_elapsed = time.monotonic() - t0
+                            self.logger.exception(
+                                "Trial %d post-evaluation agent call crashed; keeping trial result, "
+                                "reusing current config for trial %d",
+                                trial_num,
+                                trial_num + 1,
+                            )
+
+                    # Record trial (mutates question_results to free RAM).
+                    # ``meta`` is the Proposer output that *produced* ``trial_config``
+                    # (emitted by the prior trial's diagnose-and-propose step, or by
+                    # failure-recovery, or None for the initial trial). The meta just
+                    # emitted by this trial's Proposer describes the NEXT config and
+                    # is carried via ``pending_meta`` to the next iteration's record.
+                    cross_tab_snapshot = build_failure_cross_tab(result.question_results, exam)
+                    (
+                        total_prompt_tokens,
+                        total_completion_tokens,
+                        total_embedding_tokens,
+                    ) = self._finalize_trial_accounting(trial_num, trial_ledger_before, status="ok")
+                    delta_written = True
+                    record = TrialRecord(
+                        trial_number=trial_num,
+                        config=trial_config,
+                        question_results=result.question_results,
+                        answer_accuracy=result.answer_accuracy,
+                        mean_retrieval_quality=result.mean_retrieval_quality,
+                        n_em_correct=result.n_em_correct,
+                        n_judge_correct=result.n_judge_correct,
+                        n_judge_rejected=result.n_judge_rejected,
+                        n_judge_no_answer=result.n_judge_no_answer,
+                        n_judge_failed=result.n_judge_failed,
+                        n_no_answer=result.n_no_answer,
+                        n_judge_calls=result.n_judge_calls,
+                        mean_em=result.mean_em,
+                        mean_f1=result.mean_f1,
+                        mean_llm_cost_per_query_usd=result.mean_llm_cost_per_query_usd,
+                        total_llm_cost_usd=result.total_llm_cost_usd,
+                        mean_prompt_tokens=result.mean_prompt_tokens,
+                        mean_completion_tokens=result.mean_completion_tokens,
+                        total_prompt_tokens=total_prompt_tokens,
+                        total_completion_tokens=total_completion_tokens,
+                        total_embedding_tokens=total_embedding_tokens,
+                        trial_metrics=trial_metrics,
+                        diagnosis=diagnosis,
+                        meta=pending_meta,
+                        cross_tab_snapshot=cross_tab_snapshot,
+                    )
+                    self.history.add(record)
+                    pending_meta = proposal_meta
+                    # The Pareto frontier depends on every trial's (score, cost), so
+                    # ``is_pareto_optimal`` must be recomputed for ALL records on every
+                    # add — a previously-frontier trial can be displaced by a new one.
+                    self.history.recompute_pareto_flags()
+                    self.history.rewrite_all()
+                    if best is None or result.answer_accuracy > best.answer_accuracy:
+                        best = record
+
+                    cumulative_cost_usd += record.total_llm_cost_usd
+                    prev_frontier_trials = self._log_pareto_state(
+                        prev_frontier_trials=prev_frontier_trials,
+                        current_trial_number=trial_num,
+                        current_record_is_frontier=record.is_pareto_optimal,
+                    )
+
+                    trial_elapsed = time.monotonic() - trial_start
+                    pareto_tag = " ★Pareto" if (self.config.meta.cost_aware and record.is_pareto_optimal) else ""
+                    score_delta = (
+                        f" ({record.answer_accuracy - prev_score:+.3f} vs t{prev_trial_num})"
+                        if prev_score is not None
+                        else ""
+                    )
+                    cost_delta = ""
+                    if prev_cost is not None and prev_cost > 0:
+                        cost_pct = (record.mean_llm_cost_per_query_usd - prev_cost) / prev_cost * 100
+                        cost_delta = f" ({cost_pct:+.0f}% vs t{prev_trial_num})"
+                    self.logger.info(
+                        "Trial %d done in %s | accuracy %.3f%s | $%.4f/q%s | agent %s | trial $%.3f, run $%.3f%s",
+                        trial_num,
+                        self._format_duration(trial_elapsed),
+                        record.answer_accuracy,
+                        score_delta,
+                        record.mean_llm_cost_per_query_usd,
+                        cost_delta,
+                        self._format_duration(reasoning_elapsed),
+                        record.total_llm_cost_usd,
+                        cumulative_cost_usd,
+                        pareto_tag,
+                    )
+                    prev_score = record.answer_accuracy
+                    prev_cost = record.mean_llm_cost_per_query_usd
+                    prev_trial_num = trial_num
+            finally:
+                # Every iteration (scored or failed) feeds the rolling ETA so
+                # the estimate stays honest even when a trial blows up.
+                trial_durations.append(time.monotonic() - trial_start)
+                if not delta_written:
+                    # Failed trial: still write a delta line so the wasted
+                    # spend is visible in ``trial_cost_ledger.jsonl`` and
+                    # doesn't bleed into the next trial's snapshot.
+                    self._finalize_trial_accounting(trial_num, trial_ledger_before, status="failed")
+
+        # Summary
+        elapsed = time.monotonic() - t_start
+        max_score = self.history.get_best()
+        recommended = None
+        if max_score is not None:
+            recommended = await self._resolve_recommendation(ledger=ledger)
+            self._save_frontier_artifacts(
+                recommended_trial=recommended.trial_number if recommended is not None else None
+            )
+            self._log_pareto_frontier_summary()
+            self._log_run_summary(
+                elapsed=elapsed,
+                recommended=recommended,
+                max_score=max_score,
+                rag_eval_cost=cumulative_cost_usd,
+            )
+        else:
+            self.logger.info(
+                "Optimization stopped after %s — no successful trials completed.",
+                self._format_duration(elapsed),
+            )
+
+        await self.cleanup()
+
+        return recommended if recommended is not None else max_score
+
+    async def _resolve_recommendation(self, *, ledger: CostLedger) -> TrialRecord | None:
+        """Pick the config to recommend and, unless skipped, write the LLM
+        ``optimization_summary.md``.
+
+        In cost-aware mode the report model selects the recommended trial from
+        the Pareto frontier and justifies it. In score-only mode — or when the
+        report is skipped or the LLM call fails — the recommendation is the
+        cheapest of the top-scoring trials, which is always Pareto-optimal so it
+        stays consistent with the frontier artifacts. Returns the recommended
+        ``TrialRecord`` (``None`` only when no trial succeeded). The report's LLM
+        spend lands in the ``final_report`` cost bucket of the still-active ledger."""
+        records = list(self.history.records)
+        if not records:
+            return None
+        # Mechanical fallback: the cheapest config among the top scorers. Breaking
+        # the accuracy tie on cost keeps it non-dominated, so it always matches a
+        # frontier member — unlike a plain max-accuracy pick, which on an exact tie
+        # could name a dominated, more expensive trial.
+        fallback = max(records, key=lambda r: (r.answer_accuracy, -float(r.mean_llm_cost_per_query_usd)))
+        if self.skip_final_report:
+            return fallback
+
+        from agentic_autorag.optimizer.final_report import assemble_summary, generate_final_report
+
+        model = self.config.agent.optimizer_model
+        self.logger.info("Writing optimization summary via %s …", model)
+        try:
+            recommended_trial, body = await generate_final_report(
+                model=model,
+                records=records,
+                fallback_trial=fallback.trial_number,
+                exam=self.exam,
+                ledger=ledger,
+                cost_aware=self.config.meta.cost_aware,
+                include_graph=self.config.uses_graph(),
+                corpus_description=self.config.meta.corpus_description,
+            )
+        except Exception:
+            self.logger.warning("Final report generation failed — skipping optimization_summary.md", exc_info=True)
+            return fallback
+
+        recommended = next((r for r in records if r.trial_number == recommended_trial), None)
+        chosen = recommended if recommended is not None else fallback
+        markdown = assemble_summary(
+            project_name=self.config.meta.project_name,
+            records=records,
+            recommended_trial=chosen.trial_number,
+            prose_body=body,
+            include_graph=self.config.uses_graph(),
+            cost_aware=self.config.meta.cost_aware,
+        )
+        self.out_layout.summary.write_text(markdown, encoding="utf-8")
+        return chosen
+
+    def _summary_artifact_names(self) -> list[str]:
+        """Headline artifacts, for the end-of-run pointer. Existence-checked so
+        absent files (e.g. exam.json when it lives in a separate cache dir) don't
+        get advertised. Secondary files live under ``details/``."""
+        out = self.out_layout
+        headline = [out.summary, out.recommended, self.cache_layout.exam, out.run_log]
+        names = [path.name for path in headline if path.exists()]
+        if out.frontier_dir.exists():
+            names.append(f"{out.frontier_dir.name}/")
+        if out.details.exists():
+            names.append(f"{out.details.name}/")
+        return names
+
+    def _log_run_summary(
+        self,
+        *,
+        elapsed: float,
+        recommended: TrialRecord | None,
+        max_score: TrialRecord,
+        rag_eval_cost: float,
+    ) -> None:
+        """Emit a compact, scannable end-of-run verdict: the headline picks and
+        where the artifacts landed. The per-query cost shown is the rag_eval
+        spend used as the Pareto axis; the optimizer's own LLM spend is broken
+        out in the cost breakdown logged separately."""
+
+        def _pick_line(label: str, rec: TrialRecord) -> str:
+            return (
+                f"  {label:<26} trial {rec.trial_number} · "
+                f"accuracy {rec.answer_accuracy:.3f} · ${rec.mean_llm_cost_per_query_usd:.4f}/q"
+            )
+
+        sep = "═" * 60
+        self.logger.info("%s", sep)
+        self.logger.info(
+            "✓ Optimization complete · %s · %d trial(s) · rag_eval cost $%.3f",
+            self._format_duration(elapsed),
+            len(self.history.records),
+            rag_eval_cost,
+        )
+        if recommended is not None:
+            self.logger.info(
+                "%s  → recommended.yaml",
+                _pick_line("Recommended:", recommended),
+            )
+        else:
+            self.logger.info("  Recommended: none — no completed trials")
+        if recommended is None or max_score.trial_number != recommended.trial_number:
+            self.logger.info(_pick_line("Max accuracy:", max_score))
+        self.logger.info("  Results → %s", self.output_dir)
+        artifacts = self._summary_artifact_names()
+        if artifacts:
+            self.logger.info("    %s", " · ".join(artifacts))
+        self.logger.info("%s", sep)
+
+    def _log_pareto_state(
+        self,
+        *,
+        prev_frontier_trials: set[int],
+        current_trial_number: int,
+        current_record_is_frontier: bool,
+    ) -> set[int]:
+        """Log frontier diff and hypervolume after every trial. Returns
+        the new set of frontier trial numbers so the next call can diff. HV
+        uses the same cost reference (``pareto.cost_reference``) the state card uses.
+
+        Score-only runs (``cost_aware=False``) have no cost objective, so the Pareto
+        frontier is meaningless — skip the logging and leave the diff state unchanged."""
+        if not self.config.meta.cost_aware:
+            return prev_frontier_trials
+        from agentic_autorag.optimizer import pareto
+
+        records = list(self.history.records)
+        if not records:
+            return set()
+        frontier = pareto.compute_frontier(records)
+        new_frontier_trials = {int(r.trial_number) for r in frontier}
+
+        cost_values = [float(r.mean_llm_cost_per_query_usd) for r in records]
+        cost_ref = pareto.cost_reference(cost_values)
+        hv = pareto.compute_hypervolume(frontier, ref_point=(0.0, cost_ref))
+        self.logger.info(
+            "Pareto: frontier=%d (HV=%.4f, ref_cost=$%.4f/q)",
+            len(frontier),
+            hv,
+            cost_ref,
+        )
+
+        if current_record_is_frontier and current_trial_number not in prev_frontier_trials:
+            self.logger.info("Pareto: trial %d added to frontier", current_trial_number)
+        displaced = prev_frontier_trials - new_frontier_trials
+        if displaced:
+            displaced_str = ", ".join(f"trial {t}" for t in sorted(displaced))
+            self.logger.info("Pareto: displaced from frontier: %s", displaced_str)
+
+        return new_frontier_trials
+
+    def _log_pareto_frontier_summary(self) -> None:
+        """Log the final Pareto frontier (one line per non-dominated trial).
+
+        Skipped in score-only mode, where there is no cost objective to trade against."""
+        if not self.config.meta.cost_aware:
+            return
+        from agentic_autorag.optimizer import pareto
+
+        records = self.history.records
+        if not records:
+            return
+        frontier = pareto.compute_frontier(list(records))
+        if not frontier:
+            return
+        self.logger.info("Pareto frontier (%d non-dominated trials):", len(frontier))
+        for r in sorted(frontier, key=lambda x: x.answer_accuracy):
+            self.logger.info(
+                "  trial %d: accuracy=%.3f cost=$%.4f/q",
+                r.trial_number,
+                r.answer_accuracy,
+                r.mean_llm_cost_per_query_usd,
+            )
+
+    def _detect_or_load_duplicates(
+        self,
+        documents: list[str],
+        doc_ids: list[str],
+    ) -> DuplicateClusters:
+        """Run near-duplicate detection (or load a cached map). Keyed off the
+        corpus cache key + threshold so re-runs skip the all-pairs scan."""
+        parsing = self.config.parsing
+        if not parsing.near_duplicate_detection_enabled:
+            self.logger.info("Near-duplicate detection disabled; using identity alias map")
+            return DuplicateClusters(
+                canonical_doc_ids=list(doc_ids),
+                alias_to_canonical={d: d for d in doc_ids},
+            )
+
+        cache_dir = self.cache_dir / ".cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        # Threshold goes into the cache key so a tweaked threshold doesn't
+        # silently return the previous result.
+        dedup_key = hashlib.sha256(
+            json.dumps(
+                {
+                    "corpus": self._corpus_cache_key(),
+                    "threshold": parsing.near_duplicate_threshold,
+                },
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()[:16]
+        cache_path = cache_dir / f"duplicate_clusters_{dedup_key}.json"
+
+        if cache_path.exists():
+            try:
+                payload = json.loads(cache_path.read_text(encoding="utf-8"))
+                clusters = DuplicateClusters(
+                    canonical_doc_ids=list(payload["canonical_doc_ids"]),
+                    alias_to_canonical=dict(payload["alias_to_canonical"]),
+                )
+                self.logger.info(
+                    "Loaded duplicate-cluster map from %s (%d clusters, %d duplicates)",
+                    cache_path.name,
+                    clusters.n_clusters,
+                    clusters.n_duplicates,
+                )
+                return clusters
+            except Exception:
+                self.logger.warning("Cached duplicate clusters file is invalid; re-detecting", exc_info=True)
+
+        t0 = time.monotonic()
+        clusters = detect_near_duplicates(
+            documents,
+            doc_ids,
+            threshold=parsing.near_duplicate_threshold,
+        )
+        self.logger.info(
+            "Near-duplicate detection: %d documents → %d clusters (%d duplicates) in %.2fs",
+            len(documents),
+            clusters.n_clusters,
+            clusters.n_duplicates,
+            time.monotonic() - t0,
+        )
+        try:
+            cache_path.write_text(
+                json.dumps(
+                    {
+                        "canonical_doc_ids": clusters.canonical_doc_ids,
+                        "alias_to_canonical": clusters.alias_to_canonical,
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        except Exception:
+            self.logger.warning("Failed to write duplicate clusters cache", exc_info=True)
+        return clusters
+
+    def _finalize_trial_accounting(
+        self,
+        trial_number: int,
+        before_snapshot: dict,
+        *,
+        status: str = "ok",
+    ) -> tuple[int, int, int]:
+        """Write per-trial bucket delta and pending cache events; return
+        ``(prompt_tokens, completion_tokens, embedding_tokens)``. Failed trials
+        write ``status="failed"`` so downstream analyzers can keep wasted
+        spend out of headline aggregates."""
+        ledger = get_active_ledger()
+        if ledger is None:
+            self._flush_pending_cache_events(trial_number)
+            return 0, 0, 0
+
+        full_delta = ledger.delta_since(before_snapshot)
+        delta = {k: v for k, v in full_delta.items() if any(vv != 0 for vv in v.values())}
+        self.out_layout.ensure_details()
+        trial_ledger_path = self.out_layout.trial_cost_ledger
+        try:
+            with trial_ledger_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"trial_number": trial_number, "status": status, "buckets": delta}) + "\n")
+        except OSError:
+            self.logger.warning("Failed to append %s", trial_ledger_path, exc_info=True)
+
+        self._flush_pending_cache_events(trial_number)
+
+        total_prompt = sum(int(b["prompt_tokens"]) for b in delta.values())
+        total_completion = sum(int(b["completion_tokens"]) for b in delta.values())
+        total_embedding = sum(int(b["embedding_input_tokens"]) for b in delta.values())
+        return total_prompt, total_completion, total_embedding
+
+    def _debug_dir(self) -> Path:
+        """Return ``output_dir/details/debug`` (created on demand). Holds write-only
+        diagnostic artifacts — the cache-event ledger, probe audits, exam-composition
+        logs — kept out of the headline output dir."""
+        return self.out_layout.ensure_debug()
+
+    def _flush_pending_cache_events(self, trial_number: int) -> None:
+        """Drain queued trial-phase cache events to ``debug/cache_events.jsonl``.
+        Only ``phase="trial"`` events get the trial number; any leftover
+        exam-phase events get ``trial_number=null``."""
+        if not self._pending_cache_events:
+            return
+        events_path = self._debug_dir() / "cache_events.jsonl"
+        try:
+            with events_path.open("a", encoding="utf-8") as fh:
+                for event in self._pending_cache_events:
+                    tn = trial_number if event.get("phase") == "trial" else None
+                    fh.write(json.dumps({"trial_number": tn, **event}) + "\n")
+        except OSError:
+            self.logger.warning("Failed to append %s", events_path, exc_info=True)
+        finally:
+            self._pending_cache_events.clear()
+
+    def _flush_exam_gen_cache_events(self) -> None:
+        """Drain queued exam-phase cache events with ``trial_number=null`` —
+        keeps probe-phase embeddings and exam-replay events from being
+        lumped into trial 1's flush."""
+        if not self._pending_cache_events:
+            return
+        events_path = self._debug_dir() / "cache_events.jsonl"
+        try:
+            with events_path.open("a", encoding="utf-8") as fh:
+                for event in self._pending_cache_events:
+                    fh.write(json.dumps({"trial_number": None, **event}) + "\n")
+        except OSError:
+            self.logger.warning("Failed to append %s", events_path, exc_info=True)
+        finally:
+            self._pending_cache_events.clear()
+
+    def _persist_exam_cost(self, exam_cost_path: Path, before_bucket: dict) -> None:
+        """Snapshot the exam_generation bucket delta after a fresh generation.
+
+        Written unconditionally so a later orchestrator can replay the cost
+        via ``_replay_exam_cost`` even when no ledger was active at exam-gen
+        time (the bench installs per-method ledgers after setup). All-zero
+        deltas are correct for the bench's exam-gen exclusion rule.
+        """
+        after_bucket = _exam_gen_bucket_snapshot()
+        delta = {k: after_bucket[k] - before_bucket[k] for k in _REPLAYABLE_BUCKET_FIELDS}
+        try:
+            exam_cost_path.write_text(json.dumps(delta), encoding="utf-8")
+        except OSError:
+            self.logger.warning("Failed to write %s", exam_cost_path, exc_info=True)
+
+    def _replay_exam_cost(self, exam_cost_path: Path) -> None:
+        """Credit a cached exam's recorded generation cost to the active
+        ledger. Raises on missing ``exam_cost.json`` — silent under-attribution
+        would corrupt paper numbers. Remediation: wipe cache and rerun."""
+        ledger = get_active_ledger()
+        if ledger is None:
+            return
+        if not exam_cost_path.exists():
+            raise RuntimeError(
+                f"Exam cache at {self.cache_layout.exam} is missing its "
+                f"exam_cost.json sidecar. This cache was built before exam-token "
+                f"accounting; delete the cache dir and rerun."
+            )
+        cached = json.loads(exam_cost_path.read_text(encoding="utf-8"))
+        ledger.record("exam_generation", **{k: cached.get(k, 0) for k in _REPLAYABLE_BUCKET_FIELDS})
+        self._pending_cache_events.append(
+            {
+                "cache_kind": "exam",
+                # Stable, environment-independent key derived from the exam
+                # content rather than the absolute path on this machine.
+                "cache_key": _exam_cache_key(self.cache_layout.exam),
+                "tokens_credited": int(cached.get("prompt_tokens", 0) + cached.get("completion_tokens", 0)),
+                "phase": self._current_phase,
+            }
+        )
+
+    def _replay_prior_costs(self, ledger: CostLedger) -> None:
+        """On resume, re-inject prior cost totals into the fresh ledger so
+        ``cost_breakdown.json`` ends up cumulative.
+
+        Read straight from the per-trial ledger that was appended during the
+        prior run; it is the only file that captures cost AT TRIAL
+        BOUNDARIES, so summing its deltas yields the exact spend across all
+        completed trials, including the agent_proposal calls that produced
+        each next config. Setup-phase buckets (``exam_generation``,
+        ``graph_build``) are skipped because they're already replayed by
+        ``setup()`` via the per-cache sidecar JSONs — replaying them again
+        would double-count.
+        """
+        ledger_path = self.out_layout.trial_cost_ledger
+        if not ledger_path.exists():
+            return
+        skip = {"exam_generation", "graph_build"}
+        n_replayed = 0
+        for line in ledger_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            buckets = entry.get("buckets", {})
+            for name, fields in buckets.items():
+                if name in skip:
+                    continue
+                bucket = ledger.buckets.setdefault(name, CostBucket())
+                bucket.usd += float(fields.get("usd", 0.0))
+                bucket.prompt_tokens += int(fields.get("prompt_tokens", 0))
+                bucket.completion_tokens += int(fields.get("completion_tokens", 0))
+                bucket.cache_read_input_tokens += int(fields.get("cache_read_input_tokens", 0))
+                bucket.cache_creation_input_tokens += int(fields.get("cache_creation_input_tokens", 0))
+                bucket.embedding_input_tokens += int(fields.get("embedding_input_tokens", 0))
+                bucket.n_calls += int(fields.get("n_calls", 0))
+            n_replayed += 1
+        if n_replayed:
+            self.logger.info(
+                "Replayed %d prior trial ledger entries into the active CostLedger",
+                n_replayed,
+            )
+
+    def _repopulate_seen_emb_fps_from_history(self) -> None:
+        """On resume, mark every embedding fingerprint already paid for by
+        prior trials as ``seen`` so we don't double-charge the first
+        post-resume encounter. Each loaded config goes through the same
+        ``to_structural().embeddings_fingerprint`` path the live evaluator
+        uses, so we always credit the same set of fingerprints we would
+        have without the interruption.
+        """
+        corpus_hash = self._corpus_cache_key()
+        for record in self.history.records:
+            try:
+                emb_fp = record.config.to_structural().embeddings_fingerprint(corpus_hash, self._doc_ids)
+            except Exception:
+                self.logger.warning(
+                    "Could not compute emb_fp for trial %d on resume; that "
+                    "fingerprint may be charged again at first encounter.",
+                    record.trial_number,
+                    exc_info=True,
+                )
+                continue
+            self._seen_emb_fps.add(emb_fp)
+
+    def _recover_active_strategy(self, last_record: TrialRecord) -> Strategy:
+        """Restore the agent's campaign plan from the last loaded record.
+
+        The proposer that produced ``last_record.config`` emitted a
+        ``ProposalMeta`` whose ``strategy`` is the plan the agent had carried
+        forward at that point. Carrying it back into the resumed re-proposer
+        call as ``previous_strategy`` preserves the agent's plan across the
+        interruption (it is the cross-trial memory the agent owns).
+        """
+        if last_record.meta is not None and last_record.meta.strategy is not None:
+            return last_record.meta.strategy
+        return Strategy()
+
+    @staticmethod
+    def _exam_result_from_record(record: TrialRecord) -> ExamResult:
+        """Reconstruct an ``ExamResult`` from a loaded ``TrialRecord``.
+
+        Used on resume so the re-proposer call can run against the same data
+        the original would have seen. The fields ``compute_trial_metrics`` and
+        ``analyze_and_propose`` read off the result (question_results,
+        per-verdict counts, mean/total cost, mean_em/f1) are all preserved on
+        the record verbatim. Counters the record doesn't carry but
+        ``ExamResult`` declares (``n_retrieval_complete`` etc.) are left at
+        their model defaults — the proposer recomputes them from
+        ``question_results`` via ``compute_trial_metrics``.
+        """
+        return ExamResult(
+            n_correct=record.n_em_correct + record.n_judge_correct,
+            n_total=len(record.question_results),
+            n_valid=(
+                record.trial_metrics.n_valid if record.trial_metrics is not None else len(record.question_results)
+            ),
+            question_results=list(record.question_results),
+            answer_accuracy=record.answer_accuracy,
+            mean_retrieval_quality=record.mean_retrieval_quality,
+            n_em_correct=record.n_em_correct,
+            n_judge_correct=record.n_judge_correct,
+            n_judge_rejected=record.n_judge_rejected,
+            n_judge_no_answer=record.n_judge_no_answer,
+            n_judge_failed=record.n_judge_failed,
+            n_no_answer=record.n_no_answer,
+            n_judge_calls=record.n_judge_calls,
+            mean_em=record.mean_em,
+            mean_f1=record.mean_f1,
+            mean_llm_cost_per_query_usd=record.mean_llm_cost_per_query_usd,
+            total_llm_cost_usd=record.total_llm_cost_usd,
+            mean_prompt_tokens=record.mean_prompt_tokens,
+            mean_completion_tokens=record.mean_completion_tokens,
+            total_prompt_tokens=record.total_prompt_tokens,
+            total_completion_tokens=record.total_completion_tokens,
+            all_errored=False,
+        )
+
+    def _credit_embedding_build(self, index: RAGIndex) -> None:
+        """First-use-per-(method, seed) credit for an embeddings cache key.
+
+        Credits the deterministic token count to the ``embedding_build``
+        bucket and queues a cache event. Subsequent encounters of the same
+        ``emb_fp`` within this Orchestrator instance no-op.
+        """
+        emb_fp = index.emb_fp
+        if emb_fp is None or emb_fp in self._seen_emb_fps:
+            return
+        self._seen_emb_fps.add(emb_fp)
+        ledger = get_active_ledger()
+        if ledger is not None and index.embedding_input_tokens > 0:
+            ledger.record(
+                "embedding_build",
+                usd=0.0,
+                prompt_tokens=0,
+                completion_tokens=0,
+                embedding_input_tokens=index.embedding_input_tokens,
+            )
+        self._pending_cache_events.append(
+            {
+                "cache_kind": "embeddings",
+                "cache_key": emb_fp,
+                "tokens_credited": int(index.embedding_input_tokens),
+                "embedding_model": index.embedding_model,
+                "phase": self._current_phase,
+            }
+        )
+
+    def _is_direct_read_corpus(self) -> bool:
+        """True when every corpus file is directly readable as text (.md/.txt).
+
+        For such corpora the retrieval index uses the shared raw loader the
+        held-out runner uses (full doc-id universe, headings inline, identical
+        order), so optimize and held-out score the identical corpus. Mixed/PDF
+        corpora go through Docling (contextualized) instead.
+        """
+        files = list(iter_corpus_files(Path(self.config.meta.corpus_path)))
+        return bool(files) and all(f.suffix.lower() in DIRECT_READ_EXTENSIONS for f in files)
+
+    def _corpus_cache_key(self) -> str:
+        """Compute a deterministic cache key for the current corpus + parser."""
+        corpus_path = Path(self.config.meta.corpus_path)
+        parsing = self.config.parsing
+
+        file_signatures: list[tuple[str, int, int]] = []
+        for file_path in sorted(corpus_path.rglob("*")):
+            if not file_path.is_file():
+                continue
+            if file_path.name.startswith("."):
+                continue
+            if file_path.name in SKIP_FILENAMES:
+                continue
+            stat = file_path.stat()
+            rel = str(file_path.relative_to(corpus_path))
+            file_signatures.append((rel, stat.st_mtime_ns, stat.st_size))
+
+        key_data = json.dumps(
+            {
+                # Cache schema version: bump when DoclingDocument JSON shape
+                # changes or the parsing pipeline gains/loses fields.
+                "schema": 3,
+                "ocr": parsing.ocr,
+                "table_structure": parsing.table_structure,
+                "files": file_signatures,
+            },
+            sort_keys=True,
+        )
+        return hashlib.sha256(key_data.encode()).hexdigest()[:16]
+
+    def _corpus_cache_path(self) -> Path:
+        """Return the path to the corpus cache file (under shared cache_dir)."""
+        cache_dir = self.cache_dir / ".cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir / f"corpus_{self._corpus_cache_key()}.json"
+
+    def _load_and_parse_corpus(self) -> list[tuple[str, DoclingDocument]]:
+        """Recursively parse files in ``corpus_path`` via Docling, returning
+        ``(filename, DoclingDocument)`` tuples. Filename is the basename used
+        as ``source doc id`` in generated questions. Cached by file mtimes +
+        parsing options."""
+        corpus_path = Path(self.config.meta.corpus_path)
+        if not corpus_path.exists():
+            raise FileNotFoundError(f"Corpus path does not exist: {corpus_path}")
+
+        cache_path = self._corpus_cache_path()
+        if cache_path.exists():
+            self.logger.info("Loading cached parsed corpus from %s", cache_path.name)
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            return [(name, DoclingDocument.model_validate(doc_dict)) for name, doc_dict in cached]
+
+        parser_extensions = frozenset(self.parser.supported_extensions())
+        eligible = sample_corpus(
+            corpus_path=corpus_path,
+            parser_extensions=parser_extensions,
+            word_budget=self.config.meta.corpus_word_budget,
+            sample_seed=self.config.meta.corpus_sample_seed,
+            cache_dir=self.cache_dir / ".cache",
+        )
+
+        documents: list[tuple[str, DoclingDocument]] = []
+        skipped = 0
+        failed = 0
+        for file_path in tqdm(eligible, desc="   Parsing files", unit="file", smoothing=0):
+            suffix = file_path.suffix.lower()
+            if suffix not in self.parser.supported_extensions():
+                skipped += 1
+                continue
+            try:
+                dl_doc = self.parser.parse(file_path)
+            except Exception:
+                failed += 1
+                logger.warning("Failed to parse %s, skipping", file_path, exc_info=True)
+                continue
+            if dl_doc_to_chunk_text(dl_doc, max_chunk_words=self.config.examiner.max_chunk_words).strip():
+                # Stem (no extension) is the canonical doc-id, matching the
+                # held-out gold and the shared raw loader's doc-id universe.
+                documents.append((file_path.stem, dl_doc))
+
+        if skipped:
+            self.logger.info("Skipped %d unsupported file(s)", skipped)
+        if failed:
+            self.logger.warning("Failed to parse %d file(s)", failed)
+
+        try:
+            payload = [(name, dl_doc.export_to_dict()) for name, dl_doc in documents]
+            cache_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            self.logger.info("Cached parsed corpus to %s", cache_path.name)
+        except Exception:
+            self.logger.warning("Failed to write corpus cache", exc_info=True)
+
+        return documents
+
+    async def _generate_exam(
+        self,
+        documents: list[DoclingDocument],
+        doc_ids: list[str],
+        knowledge_base: KnowledgeBase | None = None,
+        optimizer_model: str | None = None,
+        index_documents: list[str] | None = None,
+        index_doc_ids: list[str] | None = None,
+    ) -> tuple[list[OpenEndedQuestion], bool]:
+        """Generate and validate the frozen open-ended exam from the corpus.
+
+        Returns ``(exam, from_cache)``.
+        """
+        exam_path = self.cache_layout.exam
+        exam_cost_path = self.cache_layout.exam_cost
+        candidates_path = self.cache_layout.candidates
+        exam_size = self.config.examiner.exam_size
+
+        # First-use rule for exam generation: snapshot the ``exam_generation``
+        # bucket before any work so we can persist the per-run delta after a
+        # fresh generation, and replay it from disk on subsequent cache hits.
+        before_bucket = _exam_gen_bucket_snapshot()
+
+        # Tag every cache event queued in this scope (probe-phase embedding
+        # builds + exam-replay) with phase="exam_gen" so the bench can filter
+        # them out of per-trial accounting. Cleanup is in the matching finally
+        # below so the phase always restores even on a surprising exception.
+        prev_phase = self._current_phase
+        self._current_phase = "exam_gen"
+
+        if exam_path.exists():
+            self.logger.info("Loading existing exam from %s", exam_path.name)
+            try:
+                raw = json.loads(exam_path.read_text(encoding="utf-8"))
+                exam = [OpenEndedQuestion.model_validate(q) for q in raw]
+                # Cached exams that fall below the minimum fraction are as
+                # poisonous to the optimizer as a freshly-generated degenerate
+                # exam — fail fast rather than billing trials against them.
+                if len(exam) < MIN_EXAM_FRACTION * exam_size:
+                    raise ExamGenerationFailed(
+                        n_actual=len(exam),
+                        n_target=exam_size,
+                        candidates_path=str(candidates_path),
+                        top_rejection_reasons=[],
+                        stage_counts={"loaded_from_cache": len(exam)},
+                    )
+                self._replay_exam_cost(exam_cost_path)
+                self._flush_exam_gen_cache_events()
+                self._current_phase = prev_phase
+                return exam, True
+            except ExamGenerationFailed:
+                self._flush_exam_gen_cache_events()
+                self._current_phase = prev_phase
+                raise
+            except Exception:
+                self.logger.warning("Existing exam file is invalid; regenerating", exc_info=True)
+
+        if len(doc_ids) != len(documents):
+            raise ValueError(f"doc_ids length ({len(doc_ids)}) does not match documents length ({len(documents)})")
+        duplicates = [name for name, count in Counter(doc_ids).items() if count > 1]
+        if duplicates:
+            raise ValueError(
+                f"Duplicate document filenames in corpus: {duplicates[:5]}{'...' if len(duplicates) > 5 else ''}"
+            )
+        # doc_map carries the canonical HybridChunker chunk-text-concat for each
+        # document — the body-only frame the composer was shown and the span
+        # verifier searches. It is the composition / verification frame only.
+        max_chunk_words = self.config.examiner.max_chunk_words
+        doc_map = {
+            doc_id: dl_doc_to_chunk_text(dl_doc, max_chunk_words=max_chunk_words)
+            for doc_id, dl_doc in zip(doc_ids, documents, strict=True)
+        }
+        # Probe indexes score on the retrieval-index corpus (full doc-id universe,
+        # headings included) that per-trial and held-out evaluation use. setup()
+        # passes it; callers exercising exam-gen in isolation fall back to the
+        # body-only doc_map.
+        if index_documents is None or index_doc_ids is None:
+            index_doc_ids = list(doc_ids)
+            index_documents = [doc_map[doc_id] for doc_id in doc_ids]
+        examiner = self.config.examiner
+
+        # Exam-generation analysis artifacts (composition log, span-verification
+        # report, multi-hop rejections) are grouped under ``output_dir/debug/``
+        # when enabled, so they stay out of the headline output dir. ``None``
+        # disables every per-artifact write below.
+        debug_dir = self._debug_dir() if examiner.save_debug_artifacts else None
+
+        exam_agent = ExamAgent(
+            config=examiner,
+            examiner_model=self.config.agent.examiner_model,
+            corpus_description=self.config.meta.corpus_description,
+            temperature=examiner.composition_temperature,
+            concurrency=self.config.agent.concurrency,
+            # Seed the preferred-type sampler from project_name so the same
+            # corpus always gets the same per-seed type assignment.
+            anchor_sampler_seed=self.config.meta.project_name,
+            reasoning_effort=self.config.agent.examiner_reasoning_effort,
+            # Per-composition-call log (input neighborhood + raw LLM response +
+            # TF-IDF diagnostics) for auditing whether the composer follows the
+            # prompt rules and inspecting the parsed-but-unstored ``reasoning``.
+            composition_log_path=(debug_dir / "composition_log.json") if debug_dir else None,
+            # Per-question source-span verification outcomes (verbatim /
+            # tolerant / snap / not_found) for diagnosing the rejection rate.
+            span_verification_report_path=(debug_dir / "span_verification.json") if debug_dir else None,
+        )
+
+        # Rank models (strongest last) for probe selection and exam
+        # composition. The oracle gate and trial judge use the explicitly
+        # configured ``agent.judge_model``, not this ranking.
+        ss = self.config.search_space
+        all_llms = ss.all_llm_models()
+        reasoning_allowed_for_rank = {m: ss.is_reasoning_allowed(m) for m in all_llms}
+        ranked_llms = await rank_models_for_probes(
+            all_llms,
+            "llm",
+            knowledge_base,
+            optimizer_model,
+            reasoning_allowed=reasoning_allowed_for_rank,
+            reasoning_effort=ss.generator.reasoning_effort,
+        )
+        ranked_embeds: list[str] | None = None
+        ranked_rerankers: list[str] | None = None
+        if examiner.probe_selection:
+            ranked_embeds = await rank_models_for_probes(
+                ss.embedding.models, "embedding", knowledge_base, optimizer_model
+            )
+            ranked_rerankers = await rank_models_for_probes(
+                ss.reranker.models, "reranker", knowledge_base, optimizer_model
+            )
+
+        validator_model = self.config.agent.judge_model
+        self.logger.info("Oracle / judge validator model: %s", validator_model)
+        # Trial-time judge picks up the same strong model so paraphrased
+        # correct answers don't get penalised by a weak grader. Guarded for
+        # tests that construct Orchestrator without going through __init__.
+        evaluator = getattr(self, "evaluator", None)
+        if evaluator is not None:
+            evaluator.judge_model = validator_model
+
+        # Load cached candidates or run composition fresh. The on-disk shape
+        # is either a v2 bare list of questions or a v3 object with
+        # ``candidates`` + ``rejections`` siblings; the loader accepts both.
+        all_candidates: list[OpenEndedQuestion] | None = None
+        if candidates_path.exists():
+            try:
+                raw_payload = json.loads(candidates_path.read_text(encoding="utf-8"))
+                raw_candidates = raw_payload.get("candidates", []) if isinstance(raw_payload, dict) else raw_payload
+                all_candidates = [OpenEndedQuestion.model_validate(q) for q in raw_candidates]
+                self.logger.info("Loaded %d cached candidates from %s", len(all_candidates), candidates_path.name)
+            except Exception:
+                self.logger.warning("Cached candidates file is invalid; regenerating", exc_info=True)
+
+        # Subset the corpus to canonical-only docs for exam generation.
+        # Per-trial IndexBuilder.build still gets the full corpus (handled by
+        # evaluate_trial), so the optimizer scores against deployed conditions.
+        # Tests that bypass setup() see an identity map so behaviour matches
+        # "no duplicates" cleanly.
+        clusters = getattr(self, "_duplicate_clusters", None) or DuplicateClusters(
+            canonical_doc_ids=list(doc_ids),
+            alias_to_canonical={d: d for d in doc_ids},
+        )
+        canonical_set = set(clusters.canonical_doc_ids)
+        canonical_documents: list[DoclingDocument] = []
+        canonical_doc_ids: list[str] = []
+        for d_id, dl_doc in zip(doc_ids, documents, strict=True):
+            if d_id in canonical_set:
+                canonical_documents.append(dl_doc)
+                canonical_doc_ids.append(d_id)
+        if len(canonical_documents) < len(documents):
+            self.logger.info(
+                "Exam generation uses %d canonical documents (full corpus has %d, %d duplicates suppressed)",
+                len(canonical_documents),
+                len(documents),
+                len(documents) - len(canonical_documents),
+            )
+
+        excluded_sections = frozenset(SectionLabel(name) for name in examiner.excluded_section_types)
+        eligible_sections = frozenset(SectionLabel) - excluded_sections
+
+        # Track stage-by-stage survival so ExamGenerationFailed can surface
+        # exactly where the funnel collapsed.
+        composition_rejection_counter: Counter[str] = Counter()
+        stage_funnel: dict[str, int] = {}
+
+        if all_candidates is None:
+            self.logger.info("Composing typed 2-hop candidates via embedding-pair pipeline")
+            all_candidates, prepared_corpus = await exam_agent.generate_exam(
+                canonical_documents,
+                canonical_doc_ids,
+                eligible_sections=eligible_sections,
+                doc_text_map=doc_map,
+                source_fact_verify_fuzzy_threshold=examiner.source_fact_verify_fuzzy_threshold,
+            )
+            composition_rejection_counter = Counter(exam_agent.last_composition_rejections)
+
+            width = len(str(max(1, len(all_candidates))))
+            for i, q in enumerate(all_candidates, start=1):
+                q.id = f"C{i:0{width}d}"
+
+            # Surface LLM refusals (linkable=False with a rejection_explanation)
+            # next to the accepted candidates so the user can audit why each
+            # neighborhood didn't yield a question. Persist even when 0
+            # candidates survived — the rejections are then the only
+            # diagnostic we have.
+            rejections: list[dict] = []
+            for cr in prepared_corpus.composition_results:
+                if cr.linkable or not cr.rejection_explanation:
+                    continue
+                rejections.append(
+                    {
+                        "anchor_chunk_id": cr.neighborhood.anchor.chunk_id,
+                        "neighborhood_chunk_ids": [c.chunk_id for c in cr.neighborhood.chunks],
+                        "reason": "llm_refused",
+                        "explanation": cr.rejection_explanation,
+                    }
+                )
+            # Post-LLM filter rejections (self_contained, empty_span_*,
+            # formula_*, pydantic_validation) — recorded inside
+            # ``_compositions_to_questions``.
+            rejections.extend(exam_agent.last_downstream_rejections)
+
+            try:
+                payload = {
+                    "candidates": [q.model_dump(mode="json") for q in all_candidates],
+                    "rejections": rejections,
+                }
+                self.cache_layout.ensure_details()
+                candidates_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+                self.logger.info(
+                    "Saved %d candidates (+ %d rejections) to %s",
+                    len(all_candidates),
+                    len(rejections),
+                    candidates_path.name,
+                )
+            except Exception:
+                self.logger.warning("Failed to write candidates file", exc_info=True)
+
+        stage_funnel["after_composition"] = len(all_candidates)
+        if not all_candidates:
+            self.logger.warning(
+                "No candidate questions survived composition — "
+                "the corpus may be too small or topically disjoint for multi-hop synthesis. "
+                "See %s for the LLM's per-seed rejection explanations.",
+                candidates_path.name,
+            )
+            raise ExamGenerationFailed(
+                n_actual=0,
+                n_target=exam_size,
+                candidates_path=str(candidates_path),
+                top_rejection_reasons=composition_rejection_counter.most_common(3),
+                stage_counts=stage_funnel,
+            )
+
+        # Oracle answerability gate. For multi-hop candidates, this same
+        # call also judges decomposability (the DeBERTa probe is gone); when
+        # debug artifacts are enabled, a per-candidate audit log lands in
+        # ``details/debug/multi_hop_rejections.json``.
+        validated = await run_validation_pipeline(
+            all_candidates,
+            documents=doc_map,
+            validator_model=validator_model,
+            judge_model=validator_model,
+            concurrency=self.config.agent.concurrency,
+            cache_dir=debug_dir,
+        )
+        self.logger.info("Validation: %d/%d candidates passed", len(validated), len(all_candidates))
+        stage_funnel["after_validation"] = len(validated)
+
+        exam = validated
+
+        # Probe discrimination filter — the core selection mechanism.
+        # Evaluates every oracle-passed candidate against up to 4 probes,
+        # then ``select_exam`` buckets by count-of-solving-probes (k) and
+        # picks ``exam_size`` items per cubed-(N-k) weights with
+        # proportional cascade when a bucket is short.
+        if examiner.probe_selection and exam:
+            labelled_probes = select_probe_configs(
+                self.config,
+                ranked_llms=ranked_llms,
+                ranked_embeds=ranked_embeds,
+                ranked_rerankers=ranked_rerankers,
+            )
+            self.logger.info(
+                "Running %d-probe discrimination filter (%d candidates, target %d)",
+                len(labelled_probes),
+                len(exam),
+                exam_size,
+            )
+            probe_results: list[ExamResult] = []
+            successful_probe_labels: list[str] = []
+            exam_index_cache: dict[str, RAGIndex] = {}
+            # Probe indexes score on the SAME retrieval corpus as the per-trial
+            # and held-out indexes (index_documents / index_doc_ids), so probe
+            # difficulty is calibrated on the deployed retrieval surface — full
+            # doc-id universe, headings included — not the body-only composition
+            # text. doc_map remains the span-verification frame above.
+            probe_documents = index_documents
+
+            # Probe runs are diagnostic — per-question MISS/SLOW lines clutter
+            # the log without adding signal (we already log per-probe summary
+            # stats and outcome patterns). Trial-time optimisation keeps the
+            # per-question lines because they help the user understand WHY a
+            # specific trial regressed. Tests construct Orchestrator without
+            # going through ``__init__`` so ``self.evaluator`` may be absent.
+            probe_evaluator = getattr(self, "evaluator", None)
+            prev_quiet = getattr(probe_evaluator, "quiet_per_question", False) if probe_evaluator else False
+            if probe_evaluator is not None:
+                probe_evaluator.quiet_per_question = True
+
+            try:
+                for i, (probe_label, probe_config) in enumerate(labelled_probes):
+                    self.logger.info("")
+                    self.logger.info("─" * 70)
+                    self.logger.info(
+                        "Probe %d/%d — %s | chunk=%d top_k=%d",
+                        i + 1,
+                        len(labelled_probes),
+                        probe_label,
+                        probe_config.chunk_token_size,
+                        probe_config.top_k,
+                    )
+                    try:
+                        probe_structural = probe_config.to_structural()
+                        probe_fp = probe_structural.fingerprint()
+                        if probe_fp in exam_index_cache:
+                            probe_index = exam_index_cache[probe_fp]
+                            self.logger.info("Reusing cached index %s", probe_fp)
+                        else:
+                            probe_index = await self.index_builder.build(
+                                probe_documents,
+                                probe_structural,
+                                corpus_hash=self._corpus_cache_key(),
+                                doc_ids=index_doc_ids,
+                            )
+                            self._credit_embedding_build(probe_index)
+                            exam_index_cache[probe_fp] = probe_index
+                        probe_index.graph_store = self.graph_store
+                        probe_embedder = self.index_builder.get_embedder(probe_config.embedding_model)
+                        probe_cross_encoder = (
+                            self.index_builder.get_cross_encoder(probe_config.reranker)
+                            if probe_config.reranker and probe_config.reranker != "none"
+                            else None
+                        )
+                        probe_pipeline = RAGPipeline(
+                            vector_store=probe_index.vector_store,
+                            graph_store=probe_index.graph_store,
+                            config=probe_config.to_runtime(
+                                reasoning_effort=self.config.search_space.generator.reasoning_effort,
+                            ),
+                            embedder=probe_embedder,
+                            index_type=probe_config.index_type,
+                            cross_encoder=probe_cross_encoder,
+                        )
+                        result = await self.evaluator.evaluate(probe_pipeline, exam)
+                        probe_results.append(result)
+                        successful_probe_labels.append(probe_label)
+                        valid_suffix = f" of {result.n_total}" if result.n_valid != result.n_total else ""
+                        self.logger.info(
+                            "Probe %d/%d %s: accuracy=%.3f (%d/%d%s) rq=%.3f",
+                            i + 1,
+                            len(labelled_probes),
+                            probe_label.split("(")[0].strip(),
+                            result.answer_accuracy,
+                            result.n_correct,
+                            result.n_valid,
+                            valid_suffix,
+                            result.mean_retrieval_quality,
+                        )
+                    except Exception:
+                        self.logger.exception("Probe %d (%s) failed; skipping", i + 1, probe_label)
+            finally:
+                if probe_evaluator is not None:
+                    probe_evaluator.quiet_per_question = prev_quiet
+
+            if probe_results:
+                outcomes, errored_ids = collect_probe_outcomes(probe_results, exam)
+                # Filter errored items BEFORE the diagnostic block — otherwise
+                # they appear (as default-zeroed 0000 vectors) in
+                # ``probe_audit_top_split.json`` and the pattern-count log,
+                # polluting the all-wrong audit whose intent is "questions a
+                # stronger config might still answer". ``select_exam`` also
+                # excludes ``errored_ids`` as defense-in-depth.
+                if errored_ids:
+                    n_before = len(exam)
+                    exam = [q for q in exam if q.id not in errored_ids]
+                    outcomes = {qid: vec for qid, vec in outcomes.items() if qid not in errored_ids}
+                    self.logger.info(
+                        "Excluded %d/%d candidate(s) with probe-evaluation errors",
+                        n_before - len(exam),
+                        n_before,
+                    )
+                # Persist the per-probe correctness vector on every
+                # candidate before selection so post-hoc analysis can read
+                # it off exam.json without recomputing.
+                exam = attach_probe_metadata(exam, outcomes)
+                # Audit JSON for the hardest items (k≤1): per-probe answers
+                # + retrieval status for offline analysis. Order-agnostic
+                # to match the selector — (1,0,0,0) and (0,1,0,0) items
+                # are included alongside (0,0,0,1) / (0,0,1,0).
+                probe_question_maps = [{qr.question_id: qr for qr in pr.question_results} for pr in probe_results]
+                audit_path = self._debug_dir() / "probe_audit_top_split.json"
+                audit_records: list[dict] = []
+                for q in exam:
+                    if not q.probe_outcomes:
+                        continue
+                    pat = "".join(str(b) for b in q.probe_outcomes)
+                    if sum(q.probe_outcomes) > 1:
+                        continue
+                    probe_entries = []
+                    for probe_idx, qmap in enumerate(probe_question_maps):
+                        label = successful_probe_labels[probe_idx]
+                        qr = qmap.get(q.id)
+                        if qr is None:
+                            probe_entries.append({"tier": label, "evaluated": False})
+                            continue
+                        probe_entries.append(
+                            {
+                                "tier": label,
+                                "correct": bool(qr.correct),
+                                "selected_answer": qr.selected_answer,
+                                "judge": qr.judge,
+                                "refused": bool(qr.refused),
+                                "retrieval_status": qr.retrieval_status,
+                                "retrieved_doc_ids": list(qr.retrieved_doc_ids),
+                            }
+                        )
+                    gold_cited_chunks = [
+                        {"doc_id": did, "span": span}
+                        for did, span in zip(q.source_doc_ids, q.source_spans, strict=False)
+                    ]
+                    audit_records.append(
+                        {
+                            "question_id": q.id,
+                            "pattern": pat,
+                            "reasoning_type": q.reasoning_type,
+                            "num_hops": q.num_hops,
+                            "question": q.question,
+                            "canonical_answer": q.canonical_answer,
+                            "answer_variants": list(q.answer_variants),
+                            "gold_cited_chunks": gold_cited_chunks,
+                            "probes": probe_entries,
+                        }
+                    )
+                audit_path.write_text(
+                    json.dumps(audit_records, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                exam = select_exam(exam, outcomes, exam_size, errored_ids=errored_ids)
+                self.logger.info("Probe selection: %d questions selected", len(exam))
+            else:
+                self.logger.warning("All probes failed; falling back to simple truncation")
+                exam = exam[:exam_size]
+        elif len(exam) > exam_size:
+            exam = exam[:exam_size]
+            self.logger.info("Truncated to exam_size=%d", exam_size)
+
+        stage_funnel["after_selection"] = len(exam)
+
+        if len(exam) < MIN_EXAM_FRACTION * exam_size:
+            self.logger.error(
+                "Exam has %d questions (target %d, minimum %d) — failing fast before optimization",
+                len(exam),
+                exam_size,
+                int(MIN_EXAM_FRACTION * exam_size),
+            )
+            raise ExamGenerationFailed(
+                n_actual=len(exam),
+                n_target=exam_size,
+                candidates_path=str(candidates_path),
+                top_rejection_reasons=composition_rejection_counter.most_common(3),
+                stage_counts=stage_funnel,
+            )
+        if len(exam) < exam_size:
+            self.logger.warning(
+                "Exam has %d questions (target %d) after filtering",
+                len(exam),
+                exam_size,
+            )
+
+        # Assign readable sequential IDs to final exam questions
+        width = len(str(len(exam)))
+        for i, q in enumerate(exam, start=1):
+            q.id = f"Q{i:0{width}d}"
+
+        try:
+            exam_path.write_text(
+                json.dumps([q.model_dump(mode="json") for q in exam], indent=2),
+                encoding="utf-8",
+            )
+            self.logger.info("Saved exam to %s", exam_path.name)
+        except Exception:
+            self.logger.warning("Failed to write exam file", exc_info=True)
+
+        self.cache_layout.ensure_details()
+        self._persist_exam_cost(exam_cost_path, before_bucket)
+        self._flush_exam_gen_cache_events()
+        self._current_phase = prev_phase
+
+        return exam, False
+
+    def _save_exam(self, exam: list[OpenEndedQuestion]) -> None:
+        """Persist the exam to JSON in the shared cache_dir.
+
+        Written atomically (unique temp + ``os.replace``) so a concurrent
+        optimizer process loading the same shared exam — the 2-runner Pareto
+        scheduler re-saves it on every cache hit — always sees a complete file
+        rather than a half-written one.
+        """
+        data = [q.model_dump(mode="json") for q in exam]
+        target = self.cache_layout.exam
+        tmp = target.with_name(f"{target.name}.tmp.{os.getpid()}")
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        os.replace(tmp, target)
+
+    def _save_frontier_artifacts(self, *, recommended_trial: int | None) -> None:
+        """Persist the Pareto frontier (runnable per-member YAMLs + ``recommended.yaml``).
+
+        ``recommended_trial`` is the optimizer's pick (LLM-selected in cost-aware
+        mode, max-accuracy otherwise). It tags the matching member as ``recommended``
+        across the artifacts and is written to ``recommended.yaml``. ``None`` when
+        no trial succeeded.
+        """
+        records = list(self.history.records)
+        if not records:
+            return None
+        frontier = pareto.compute_frontier(records)
+        if not frontier:
+            return None
+
+        max_score_record = max(frontier, key=lambda r: r.answer_accuracy)
+        max_score_trial = max_score_record.trial_number
+
+        self._write_frontier_dir(
+            frontier=frontier,
+            recommended_trial=recommended_trial,
+            max_score_trial=max_score_trial,
+        )
+        recommended = next((r for r in records if r.trial_number == recommended_trial), None)
+        if recommended is not None:
+            self._write_recommended(recommended)
+
+    def _write_frontier_dir(
+        self,
+        *,
+        frontier: list[TrialRecord],
+        recommended_trial: int | None,
+        max_score_trial: int,
+    ) -> None:
+        frontier_dir = self.out_layout.frontier_dir
+        frontier_dir.mkdir(parents=True, exist_ok=True)
+        for record in frontier:
+            tags: list[str] = []
+            if record.trial_number == recommended_trial:
+                tags.append("recommended")
+            if record.trial_number == max_score_trial:
+                tags.append("max-accuracy")
+            header = [
+                f"# Frontier member: trial {record.trial_number}",
+                f"# accuracy: {record.answer_accuracy:.4f}",
+                f"# cost/q:   ${record.mean_llm_cost_per_query_usd:.4f}",
+                f"# total:    ${record.total_llm_cost_usd:.4f}",
+            ]
+            if tags:
+                header.append(f"# tags:     {', '.join(tags)}")
+            payload = record.config.to_prompt_dump(include_graph=self.config.uses_graph())
+            body = yaml.safe_dump(payload, sort_keys=False)
+            target = frontier_dir / f"trial_{record.trial_number:02d}.yaml"
+            target.write_text("\n".join(header) + "\n" + body, encoding="utf-8")
+        self.logger.info("Saved frontier configs to %s/ (%d members)", frontier_dir, len(frontier))
+
+    def _write_recommended(self, record: TrialRecord) -> None:
+        payload = record.config.to_prompt_dump(include_graph=self.config.uses_graph())
+        body = yaml.safe_dump(payload, sort_keys=False)
+        header = (
+            f"# Recommended config: trial {record.trial_number}\n"
+            f"# accuracy: {record.answer_accuracy:.4f}  cost/q: ${record.mean_llm_cost_per_query_usd:.4f}\n"
+        )
+        target = self.out_layout.recommended
+        target.write_text(header + body, encoding="utf-8")
+        self.logger.info("Saved recommended config to %s", target)
+
+    def _report_cost_breakdown(self, ledger: CostLedger) -> None:
+        """Log + persist a per-category LLM cost breakdown for the run.
+
+        ``rag_eval`` covers the trial-time generation calls (Pareto-relevant);
+        the other buckets cover everything else the optimizer spends on LLMs.
+        """
+        if not ledger.buckets:
+            return
+        total = ledger.total_usd()
+        # Stable display order; unknown categories appear last alphabetically.
+        order = ("rag_eval", "exam_generation", "judge", "agent_proposal", "graph_build", "final_report")
+        ordered = [c for c in order if c in ledger.buckets]
+        ordered += sorted(c for c in ledger.buckets if c not in order)
+        self.logger.info("LLM cost breakdown:")
+        for category in ordered:
+            bucket = ledger.buckets[category]
+            cache_parts: list[str] = []
+            if bucket.cache_read_input_tokens > 0:
+                cache_parts.append(f"{bucket.cache_read_input_tokens} cache-read")
+            if bucket.cache_creation_input_tokens > 0:
+                cache_parts.append(f"{bucket.cache_creation_input_tokens} cache-write")
+            cache_suffix = f" [of which {' + '.join(cache_parts)}]" if cache_parts else ""
+            self.logger.info(
+                "  %-18s $%.4f  (%d call(s), %d prompt + %d completion tokens%s)",
+                category,
+                bucket.usd,
+                bucket.n_calls,
+                bucket.prompt_tokens,
+                bucket.completion_tokens,
+                cache_suffix,
+            )
+        self.logger.info("  %-18s $%.4f", "TOTAL", total)
+        try:
+            self.out_layout.ensure_details()
+            self.out_layout.cost_breakdown.write_text(
+                json.dumps(ledger.to_dict(), indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            self.logger.warning("Failed to write cost_breakdown.json", exc_info=True)
+
+    async def _propose_next_config_with_retries(
+        self,
+        result: ExamResult,
+        exam: list[OpenEndedQuestion],
+        current_config: TrialConfig,
+        *,
+        trial_number: int,
+        trials_remaining: int,
+        previous_strategy: Strategy | None,
+    ) -> tuple:
+        """Call the agent up to 5 times; reuse previous config on failure.
+
+        Returns ``(trial_metrics, diagnosis, next_config, proposal_meta)``.
+        On persistent failure, returns ``(None, None, current_config, None)``
+        so the loop can still progress with the previous config.
+        """
+        for attempt in range(1, 6):
+            try:
+                return await self.agent.analyze_and_propose(
+                    result,
+                    exam,
+                    current_config,
+                    trial_number=trial_number,
+                    trials_remaining=trials_remaining,
+                    previous_strategy=previous_strategy,
+                )
+            except Exception:
+                self.logger.exception("Agent proposal attempt %d/5 failed", attempt)
+        self.logger.error("Agent failed after 5 retries; reusing previous config")
+        return None, None, current_config, None
+
+    @staticmethod
+    def _setup_logger(output_dir: Path) -> logging.Logger:
+        """Configure run logger + parent ``agentic_autorag`` logger so high-
+        signal setup lines (NER backend, entity histogram, prepared-corpus
+        stats) reach both ``run.log`` and the console even without
+        ``--verbose``."""
+        formatter = logging.Formatter("%(message)s")
+        log_path = output_dir / RUN_LOG_FILE
+        # Truncate once explicitly; both file handlers below open in "a" so
+        # they cooperate via O_APPEND instead of racing on file offsets.
+        log_path.write_text("", encoding="utf-8")
+
+        run_console = logging.StreamHandler()
+        run_console.setLevel(logging.INFO)
+        run_console.setFormatter(formatter)
+
+        run_file = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+        run_file.setLevel(logging.DEBUG)
+        run_file.setFormatter(formatter)
+
+        run_logger = logging.getLogger("agentic_autorag.run")
+        run_logger.setLevel(logging.DEBUG)
+        run_logger.propagate = False
+        for handler in list(run_logger.handlers):
+            run_logger.removeHandler(handler)
+        run_logger.addHandler(run_console)
+        run_logger.addHandler(run_file)
+
+        parent_file = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+        parent_file.setLevel(logging.INFO)
+        parent_file.setFormatter(formatter)
+        parent_console = logging.StreamHandler()
+        parent_console.setLevel(logging.INFO)
+        parent_console.setFormatter(formatter)
+
+        parent_logger = logging.getLogger("agentic_autorag")
+        parent_logger.setLevel(logging.INFO)
+        parent_logger.propagate = False
+        # Drop only previously-attached handlers to avoid stacking when
+        # _setup_logger is called more than once in a process.
+        for handler in list(parent_logger.handlers):
+            if isinstance(handler, (logging.FileHandler, logging.StreamHandler)):
+                parent_logger.removeHandler(handler)
+        parent_logger.addHandler(parent_file)
+        parent_logger.addHandler(parent_console)
+
+        return run_logger
+
+    def _log_config_summary(self, label: str, config: TrialConfig) -> None:
+        reasoning_tag = " +reasoning" if config.reasoning else ""
+        llm_summary = _format_per_stage_llm(config)
+        self.logger.info(
+            "%s | chunk=%s strategy=%s embed=%s index=%s top_k=%s alpha=%s fusion=%s reorder=%s "
+            "compressor=%s expansion=%s reranker=%s rerank_top_n=%s llm=%s%s temp=%s",
+            label,
+            config.chunk_token_size,
+            config.chunking_strategy,
+            config.embedding_model,
+            config.index_type.value,
+            config.top_k,
+            config.hybrid_alpha,
+            config.bm25_vector_fusion,
+            config.long_context_reorder,
+            config.passage_compressor,
+            config.query_expansion,
+            config.reranker,
+            config.reranker_top_n,
+            llm_summary,
+            reasoning_tag,
+            config.temperature,
+        )
+
+    @staticmethod
+    def _diff_pairs(old: TrialConfig, new: TrialConfig) -> list[tuple[str, object, object]]:
+        """All config lever pairs the optimizer can change. Iterates
+        ``CONFIG_LEVER_FIELDS`` so this stays in sync with the agent-facing
+        diff (``state._config_diff_summary``)."""
+        pairs: list[tuple[str, object, object]] = []
+        for name in CONFIG_LEVER_FIELDS:
+            ov = getattr(old, name, None)
+            nv = getattr(new, name, None)
+            ov = getattr(ov, "value", ov)
+            nv = getattr(nv, "value", nv)
+            pairs.append((name, ov, nv))
+        return pairs
+
+    def _log_config_diff(self, old: TrialConfig, new: TrialConfig) -> None:
+        changes = [
+            f"{name}: {old_val} -> {new_val}"
+            for name, old_val, new_val in self._diff_pairs(old, new)
+            if old_val != new_val
+        ]
+        if changes:
+            self.logger.info("Config changes: %s", "; ".join(changes))
+            self.logger.debug("Full config diff details: %s", changes)
+        else:
+            self.logger.info("Config: no changes")

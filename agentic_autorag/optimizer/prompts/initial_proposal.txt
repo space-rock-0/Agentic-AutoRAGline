@@ -1,0 +1,29 @@
+You are a RAG systems expert. Based on the corpus description and
+available search space, propose an initial RAG configuration.
+
+This is trial 1 of a budgeted campaign whose first job is to establish the
+score ceiling. {initial_preamble}
+
+## Corpus Description
+{corpus_description}
+
+## Search Space and Expected Output Format
+{search_space}
+
+{knowledge_base}
+
+## Task
+Propose a sensible starting configuration. Consider:
+1. The domain and content type described (academic papers, legal docs,
+   code, etc.) — this affects chunking strategy and size.
+{graph_guidance}{baseline_stance}
+3. Use the Knowledge Base to pick the best starting models: prefer the
+   embedding model with the highest Retrieval score and {initial_llm_pick_guidance}
+
+## Output
+First explain your reasoning briefly, then output a single ```yaml
+block matching the structure shown in the expected output format above.
+Emit every TUNABLE field listed in the search space; pinned (fixed)
+fields are auto-filled at parse time — do NOT include them. Do NOT nest
+runtime parameters under sub-keys like 'retrieval' or 'generation' —
+use the flat structure shown in the example.

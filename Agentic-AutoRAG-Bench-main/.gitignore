@@ -1,0 +1,73 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Virtualenvs
+.venv/
+.autorag-venv/
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Run artefacts inside the committed paper results/ tree — keep only the
+# small per-method best_config + history + benchmark_results JSONs.
+results/**/.cache/
+results/**/lightrag/
+results/**/run.log
+results/**/optuna.db
+results/**/optuna_sampler.pkl
+
+# AutoRAG project_dir caches (subprocess outputs are big; we keep
+# extracted_sample.yaml + translation_notes.json only).
+results/**/autorag_project/data/
+results/**/autorag_project/0/
+results/**/autorag_project/resources/
+
+# Benchmark data: the bulky, regeneratable parts (corpus/, qa.json) are not
+# tracked -- `agentic-autorag-bench benchmark-prepare` rebuilds them from the
+# HuggingFace revision pinned in metadata.json. Everything that *defines* a
+# paper number is tracked, so the exact evaluation set stays in git history:
+#   validation_exam.json        Experiment-1 optimization target (+ provenance)
+#   splits/holdout_qa.json      the 300-question held-out slice behind Table 1
+#   splits/optimization_qa.json the pool the exam was drawn from (+ provenance)
+#   metadata.json               pinned HF revision, sample size, and seed
+# Together these are ~3 MB and cannot be regenerated if the working tree is lost.
+benchmark_data/*
+!benchmark_data/*/
+benchmark_data/*/*
+!benchmark_data/*/validation_exam.json
+!benchmark_data/*/validation_exam_provenance.json
+!benchmark_data/*/metadata.json
+!benchmark_data/*/splits/
+!benchmark_data/*/splits/*.json
+
+# Editor state
+*.swp
+
+# Logs
+*.log
+logs/
+
+# Environment
+.env
+
+# Dev / exploratory run outputs: any `results_<variant>/` directory at the
+# repo root (results_dev, results_smoke, results_larger, ...). The single
+# committed `results/` tree above is the only one that ships with the paper;
+# if a specific variant ever needs to ship, override with `!results_<name>/`.
+results_*/
+
+# Exploratory analysis artifacts paired with the results_* runs.
+*_artifacts/
+
+# Session-local scratch — not part of the shipped benchmark artifact.
+/CLAUDE.md
+/knowledge_base_render.md
+*.out
+configs/_canary_*

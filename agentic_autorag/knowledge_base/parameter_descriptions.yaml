@@ -1,0 +1,94 @@
+# Parameter descriptions and project-specific constraints for the RAG
+# optimizer agent. Generic textbook guidance is intentionally omitted —
+# the LLM already knows it. What's here is either (a) what the parameter
+# does, (b) hard constraints/dependencies the LLM cannot infer, or
+# (c) option semantics specific to this codebase.
+
+parameters:
+  chunking_strategy:
+    description: "How documents are split into chunks before indexing."
+    options:
+      recursive: "Splits text using a hierarchy of separators (paragraphs → sentences → words). Preserves semantic boundaries."
+      fixed: "Splits at fixed character intervals regardless of content. May cut mid-sentence."
+
+  chunk_token_size:
+    description: "Maximum tokens per chunk (in the embedding model's tokenizer, NOT characters)."
+    guidance: "Must not exceed the embedding model's max_tokens limit (shown in the Embedding Models table)."
+
+  chunk_token_overlap:
+    description: "Tokens shared between consecutive chunks to avoid information loss at boundaries. Must be < chunk_token_size."
+
+  embedding_model:
+    description: "Model that converts text into dense vector embeddings for similarity search."
+    guidance: "max_tokens must be ≥ chunk_token_size. Changing the embedding model triggers a full index rebuild."
+
+  index_type:
+    description: "The type of search index built from chunks."
+    options:
+      vector_only: "Pure vector (semantic) similarity search."
+      hybrid_bm25_vector: "Combines BM25 keyword search with vector search via the fusion controlled by bm25_vector_fusion / hybrid_alpha."
+      graph_only: "Knowledge graph search via LightRAG. Requires a pre-built graph index."
+      hybrid_graph_vector: "Combines graph traversal with vector search. Requires a pre-built graph index."
+
+  top_k:
+    description: "Number of chunks retrieved from the index and sent to the reranker (or LLM if no reranker)."
+
+  hybrid_alpha:
+    description: "Balance between BM25 (0.0) and vector (1.0) for hybrid_bm25_vector retrieval. Only consulted when bm25_vector_fusion='alpha'."
+
+  bm25_vector_fusion:
+    description: "How BM25 and vector results are fused for hybrid_bm25_vector retrieval."
+    options:
+      alpha: "Tunable blend on normalized scores (controlled by hybrid_alpha)."
+      rrf: "Reciprocal Rank Fusion with k=60 (ignores hybrid_alpha)."
+
+  long_context_reorder:
+    description: "Duplicate the top-scored passage at the END of the joined context (input order otherwise preserved). No-op when passage_compressor collapses retrieval to a single passage."
+
+  passage_compressor:
+    description: "Optional LLM-based compression applied to retrieved passages before they reach the generator."
+    options:
+      none: "Pass passages through verbatim."
+      tree_summarize: "Recursively summarise passages in batches; concurrent within each level."
+      refine: "Iteratively refine a running answer one passage at a time; serial."
+
+  reranker:
+    description: "Cross-encoder model that re-scores the top_k retrieved chunks for improved precision. 'none' skips reranking."
+
+  reranker_top_n:
+    description: "Number of chunks kept after reranking. Must be ≤ top_k."
+
+  query_expansion:
+    description: "Technique to reformulate or expand the query before retrieval."
+    options:
+      none: "Use the query as-is."
+      hyde: "Generate a hypothetical answer, then prepend it to the original query."
+      multi_query: "Generate up to three rephrasings and prepend them to the original query."
+      query_decompose: "Decompose multi-hop queries into self-contained sub-queries that REPLACE the original. Costs one extra LLM call per query and multiplies retrieval work by N."
+
+  generator_llm:
+    description: "Language model that produces the final answer from retrieved context. The model the user sees."
+    guidance: "Reasoning mode (reasoning_effort) applies ONLY to this stage — compressor/expander calls are always non-reasoning."
+
+  compressor_llm:
+    description: "Language model drawn from the passage_compressor pool when that stage runs (tree_summarize / refine). Auto-resolved when the pool has one entry."
+
+  expander_llm:
+    description: "Language model drawn from the query_expansion pool when that stage runs (hyde / multi_query / query_decompose). Auto-resolved when the pool has one entry."
+
+  temperature:
+    description: "Sampling temperature applied to every LLM call (generator, compressor, expander) — single shared value across stages."
+
+  reasoning:
+    description: "Enable extended reasoning/thinking mode for the generator stage via LiteLLM's reasoning_effort parameter."
+    guidance: "Only the generator's final-answer call uses reasoning_effort; compressor/expander calls are always non-reasoning. The Knowledge Base table's '(reasoning)' rows show the Intelligence Index measured with reasoning on — it can differ from non-reasoning rows in unexpected ways (different evaluation conditions, not degradation)."
+
+  graph_query_mode:
+    description: "How the knowledge graph is traversed. Only relevant when index_type is graph_only or hybrid_graph_vector."
+    options:
+      local: "Entity-focused: retrieves facts about specific named entities."
+      global: "Relationship-focused: traverses broader cross-entity relationships."
+      hybrid: "Combines local and global."
+
+  graph_top_k:
+    description: "Number of graph nodes explored during graph retrieval."

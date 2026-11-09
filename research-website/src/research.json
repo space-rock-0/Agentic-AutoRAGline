@@ -1,0 +1,524 @@
+{
+  "tables": [
+    {
+      "id": "t1",
+      "title": "Corpus sizes",
+      "page": 5,
+      "headers": ["Corpus", "Documents", "Words", "Words / document"],
+      "rows": [
+        ["HotpotQA", 19276, "1.81M", 94],
+        ["MuSiQue", 17629, "1.32M", 75],
+        ["MultiHop-RAG", 609, "1.07M", 1760],
+        ["UniDoc", 250, "1.30M", 5214]
+      ],
+      "note": "Table 1. Corpus sizes used in the experiments."
+    },
+    {
+      "id": "t2",
+      "title": "Held-out answer quality",
+      "page": 7,
+      "headers": [
+        "Method",
+        "Hotpot EM",
+        "Hotpot F1",
+        "Hotpot Judge",
+        "MuSiQue EM",
+        "MuSiQue F1",
+        "MuSiQue Judge",
+        "MultiHop EM",
+        "MultiHop F1",
+        "MultiHop Judge"
+      ],
+      "rows": [
+        [
+          "Random",
+          "0.506 ± 0.038",
+          "0.664 ± 0.041",
+          "0.774 ± 0.046",
+          "0.165 ± 0.029",
+          "0.215 ± 0.035",
+          "0.270 ± 0.036",
+          "0.633 ± 0.065",
+          "0.651 ± 0.063",
+          "0.706 ± 0.048"
+        ],
+        [
+          "MO-TPE",
+          "0.515 ± 0.057",
+          "0.673 ± 0.056",
+          "0.784 ± 0.056",
+          "0.193 ± 0.024",
+          "0.254 ± 0.032",
+          "0.301 ± 0.032",
+          "0.664 ± 0.045",
+          "0.677 ± 0.042",
+          "0.724 ± 0.028"
+        ],
+        [
+          "MO-TPE (warm)",
+          "0.521 ± 0.044",
+          "0.677 ± 0.055",
+          "0.786 ± 0.057",
+          "0.183 ± 0.030",
+          "0.243 ± 0.032",
+          "0.301 ± 0.039",
+          "0.666 ± 0.051",
+          "0.682 ± 0.047",
+          "0.731 ± 0.045"
+        ],
+        [
+          "Agentic (no KB/diag)",
+          "0.550 ± 0.020",
+          "0.711 ± 0.024",
+          "0.819 ± 0.025",
+          "0.180 ± 0.022",
+          "0.230 ± 0.028",
+          "0.298 ± 0.024",
+          "0.729 ± 0.037",
+          "0.748 ± 0.035",
+          "0.780 ± 0.021"
+        ],
+        [
+          "Agentic@10",
+          "0.558 ± 0.015",
+          "0.715 ± 0.017",
+          "0.817 ± 0.014",
+          "0.177 ± 0.023",
+          "0.231 ± 0.028",
+          "0.303 ± 0.030",
+          "0.679 ± 0.056",
+          "0.697 ± 0.055",
+          "0.773 ± 0.021"
+        ],
+        [
+          "Agentic@20",
+          "0.568 ± 0.012",
+          "0.727 ± 0.009",
+          "0.835 ± 0.013",
+          "0.198 ± 0.027",
+          "0.261 ± 0.028",
+          "0.326 ± 0.030",
+          "0.704 ± 0.060",
+          "0.723 ± 0.061",
+          "0.783 ± 0.026"
+        ],
+        [
+          "Agentic (Ours)",
+          "0.566 ± 0.015",
+          "0.723 ± 0.014",
+          "0.825 ± 0.015",
+          "0.196 ± 0.031",
+          "0.262 ± 0.028",
+          "0.330 ± 0.025",
+          "0.729 ± 0.054",
+          "0.748 ± 0.055",
+          "0.790 ± 0.029"
+        ],
+        [
+          "KB Greedy",
+          "0.480 ± 0.016",
+          "0.611 ± 0.016",
+          "0.702 ± 0.019",
+          "0.150 ± 0.008",
+          "0.187 ± 0.008",
+          "0.254 ± 0.014",
+          "0.507 ± 0.011",
+          "0.518 ± 0.011",
+          "0.544 ± 0.014"
+        ]
+      ],
+      "note": "Table 2. Mean ± SD across 10 search seeds. Each configuration is evaluated on a disjoint 300-question stratified gold test slice. @10/@20 select the best validation configuration within those trial budgets. KB Greedy is a no-search reference."
+    },
+    {
+      "id": "t3",
+      "title": "UniDoc question taxonomy",
+      "page": 11,
+      "headers": ["Question type", "Count"],
+      "rows": [
+        ["Extraction", 16],
+        ["Definitional", 0],
+        ["Numeric (single-span)", 1],
+        ["Inference", 25],
+        ["Bridge", 19],
+        ["Comparison", 25],
+        ["Numeric (multi-span)", 14],
+        ["Total", 100]
+      ],
+      "note": "Table 3. Frozen generated exam after validation and probe selection. 98 questions stay within one document; 2 cross documents."
+    },
+    {
+      "id": "t4",
+      "title": "Generator model knowledge",
+      "page": 15,
+      "headers": [
+        "Model",
+        "Creator",
+        "Intelligence",
+        "GPQA",
+        "IFBench",
+        "Input $ / 1M",
+        "Output $ / 1M",
+        "Tokens / s",
+        "Reasoning"
+      ],
+      "rows": [
+        ["glm-4.7", "Z AI", 42.1, 0.859, 0.679, 0.6, 2.2, 86, "Yes"],
+        ["gpt-5-mini", "OpenAI", 38.9, 0.803, 0.712, 0.25, 2, 106, "Yes"],
+        ["gpt-5.4-mini", "OpenAI", 37.7, 0.823, 0.648, 0.75, 4.5, 172, "Yes"],
+        ["gpt-oss-120b", "OpenAI", 33.3, 0.782, 0.69, 0.15, 0.6, 289, "Yes"],
+        ["gemini-2.5-flash", "Google", 27, 0.79, 0.503, 0.3, 2.5, 225, "Yes"],
+        ["gpt-5-nano", "OpenAI", 25.9, 0.67, 0.659, 0.05, 0.4, 151, "Yes"],
+        ["gpt-4.1-mini", "OpenAI", 22.9, 0.664, 0.383, 0.4, 1.6, 80, "No"],
+        ["mistral-large-3", "Mistral", 22.8, 0.68, 0.362, 0.5, 1.5, 58, "No"],
+        ["llama4-maverick", "Meta", 18.4, 0.671, 0.43, 0.24, 0.97, 122, "No"],
+        ["gpt-4o", "OpenAI", 17.3, 0.543, 0.343, 2.5, 10, 172, "No"],
+        ["nova-micro", "Amazon", 10.3, 0.358, 0.294, 0.04, 0.14, 318, "No"],
+        ["gemma-3-4b", "Google", 6.3, 0.291, 0.283, 0.04, 0.08, null, "No"]
+      ],
+      "note": "Table 4. Twelve-model slice; the full 35-model pool renders as 49 reasoning/non-reasoning entries. Historical May 2026 snapshot, not current pricing. Null indicates unpublished data."
+    },
+    {
+      "id": "t5",
+      "title": "Embedding model knowledge",
+      "page": 15,
+      "headers": [
+        "Model",
+        "Dimensions",
+        "Max tokens",
+        "Parameters (B)",
+        "Retrieval",
+        "STS",
+        "Reranking",
+        "Memory (MB)"
+      ],
+      "rows": [
+        ["Yuan-embedding-2.0-en", 1024, 2048, 0.596, 0.707, 0.849, 0.533, 2272],
+        ["Qwen3-Embedding-0.6B", 1024, 32768, 0.596, 0.618, 0.858, 0.482, 1136],
+        [
+          "snowflake-arctic-embed-l-v2.0",
+          1024,
+          8192,
+          0.568,
+          0.586,
+          0.77,
+          0.475,
+          2166
+        ],
+        [
+          "granite-embedding-english-r2",
+          768,
+          8192,
+          0.149,
+          0.564,
+          0.781,
+          0.491,
+          284
+        ],
+        ["mxbai-embed-large-v1", 1024, 512, 0.335, 0.556, 0.772, 0.48, 639],
+        ["bge-large-en-v1.5", 1024, 512, 0.335, 0.554, 0.759, 0.483, 1242],
+        [
+          "granite-embedding-small-english-r2",
+          384,
+          8192,
+          0.048,
+          0.539,
+          0.766,
+          0.476,
+          91
+        ],
+        ["bge-small-en-v1.5", 512, 512, 0.033, 0.539, 0.739, 0.469, 127],
+        [
+          "multilingual-e5-large-instruct",
+          1024,
+          514,
+          0.56,
+          0.535,
+          0.843,
+          0.487,
+          1068
+        ],
+        ["snowflake-arctic-embed-xs", 384, 512, 0.023, 0.526, 0.728, 0.453, 86],
+        ["bge-m3", 1024, 8194, 0.568, 0.51, 0.799, null, 2167],
+        ["e5-large-v2", 1024, 514, 0.335, 0.493, 0.749, 0.457, 1278],
+        ["all-MiniLM-L6-v2", 384, 256, 0.023, 0.43, 0.704, 0.471, 87]
+      ],
+      "note": "Table 5. Complete 13-model MTEB(eng, v2) snapshot. Scores are fractions; memory is MB. Model names are abbreviated as in the source."
+    },
+    {
+      "id": "t6",
+      "title": "Reranker model knowledge",
+      "page": 15,
+      "headers": ["Model", "Parameters (B)", "MTEB-R", "MMTEB-R", "FollowIR"],
+      "rows": [
+        ["bge-reranker-v2-m3", 0.6, 0.57, 0.584, -0.01],
+        ["ms-marco-MiniLM-L-6-v2", 0.022, null, null, null],
+        ["gte-reranker-modernbert-base", null, null, null, null],
+        ["mxbai-rerank-xsmall-v1", null, null, null, null]
+      ],
+      "note": "Table 6. Four rerankers plus a fifth choice, none. Sparse coverage: only one reranker has published scores in this snapshot. Missing is not zero."
+    }
+  ],
+  "scores": [
+    {
+      "method": "Random",
+      "datasets": [
+        [
+          [0.506, 0.038],
+          [0.664, 0.041],
+          [0.774, 0.046]
+        ],
+        [
+          [0.165, 0.029],
+          [0.215, 0.035],
+          [0.27, 0.036]
+        ],
+        [
+          [0.633, 0.065],
+          [0.651, 0.063],
+          [0.706, 0.048]
+        ]
+      ]
+    },
+    {
+      "method": "MO-TPE",
+      "datasets": [
+        [
+          [0.515, 0.057],
+          [0.673, 0.056],
+          [0.784, 0.056]
+        ],
+        [
+          [0.193, 0.024],
+          [0.254, 0.032],
+          [0.301, 0.032]
+        ],
+        [
+          [0.664, 0.045],
+          [0.677, 0.042],
+          [0.724, 0.028]
+        ]
+      ]
+    },
+    {
+      "method": "MO-TPE (warm)",
+      "datasets": [
+        [
+          [0.521, 0.044],
+          [0.677, 0.055],
+          [0.786, 0.057]
+        ],
+        [
+          [0.183, 0.03],
+          [0.243, 0.032],
+          [0.301, 0.039]
+        ],
+        [
+          [0.666, 0.051],
+          [0.682, 0.047],
+          [0.731, 0.045]
+        ]
+      ]
+    },
+    {
+      "method": "Agentic (no KB/diag)",
+      "datasets": [
+        [
+          [0.55, 0.02],
+          [0.711, 0.024],
+          [0.819, 0.025]
+        ],
+        [
+          [0.18, 0.022],
+          [0.23, 0.028],
+          [0.298, 0.024]
+        ],
+        [
+          [0.729, 0.037],
+          [0.748, 0.035],
+          [0.78, 0.021]
+        ]
+      ]
+    },
+    {
+      "method": "Agentic@10",
+      "datasets": [
+        [
+          [0.558, 0.015],
+          [0.715, 0.017],
+          [0.817, 0.014]
+        ],
+        [
+          [0.177, 0.023],
+          [0.231, 0.028],
+          [0.303, 0.03]
+        ],
+        [
+          [0.679, 0.056],
+          [0.697, 0.055],
+          [0.773, 0.021]
+        ]
+      ]
+    },
+    {
+      "method": "Agentic@20",
+      "datasets": [
+        [
+          [0.568, 0.012],
+          [0.727, 0.009],
+          [0.835, 0.013]
+        ],
+        [
+          [0.198, 0.027],
+          [0.261, 0.028],
+          [0.326, 0.03]
+        ],
+        [
+          [0.704, 0.06],
+          [0.723, 0.061],
+          [0.783, 0.026]
+        ]
+      ]
+    },
+    {
+      "method": "Agentic (Ours)",
+      "datasets": [
+        [
+          [0.566, 0.015],
+          [0.723, 0.014],
+          [0.825, 0.015]
+        ],
+        [
+          [0.196, 0.031],
+          [0.262, 0.028],
+          [0.33, 0.025]
+        ],
+        [
+          [0.729, 0.054],
+          [0.748, 0.055],
+          [0.79, 0.029]
+        ]
+      ]
+    },
+    {
+      "method": "KB Greedy",
+      "datasets": [
+        [
+          [0.48, 0.016],
+          [0.611, 0.016],
+          [0.702, 0.019]
+        ],
+        [
+          [0.15, 0.008],
+          [0.187, 0.008],
+          [0.254, 0.014]
+        ],
+        [
+          [0.507, 0.011],
+          [0.518, 0.011],
+          [0.544, 0.014]
+        ]
+      ]
+    }
+  ],
+  "figures": [
+    {
+      "id": 1,
+      "page": 3,
+      "title": "The complete architecture",
+      "caption": "TF-IDF neighborhoods feed the Composer, validation and four probes create a frozen exam, and the Diagnoser–Proposer loop searches configurations.",
+      "file": "figure-1.png"
+    },
+    {
+      "id": 2,
+      "page": 6,
+      "title": "How quickly search improves",
+      "caption": "Best-so-far validation accuracy, averaged over 10 seeds, with ±1 SD bands. These validation curves are distinct from held-out Table 2 scores.",
+      "file": "figure-2.png"
+    },
+    {
+      "id": 3,
+      "page": 7,
+      "title": "The accuracy–cost frontier",
+      "caption": "Point-wise median attainment over 10 seeds; bands show the 25th–75th percentiles. Cost per query is on a logarithmic USD axis.",
+      "file": "figure-3.png"
+    },
+    {
+      "id": 4,
+      "page": 16,
+      "title": "What search actually costs",
+      "caption": "Mean search dollars split into reasoning and evaluation, and embedding input tokens in millions; whiskers show ±1 SD across 10 seeds.",
+      "file": "figure-4.png"
+    }
+  ],
+  "appendix": [
+    {
+      "title": "Question taxonomy and source spans",
+      "page": 11,
+      "text": "Orion Weller, Benjamin Chang, Sean MacAvaney, Kyle\nLo, Arman Cohan, Benjamin Van Durme, Dawn\nLawrie, and Luca Soldaini. 2025. FollowIR: Eval-\nuating and teaching information retrieval models to\nfollow instructions. In Proceedings of the 2025 Con-\nference of the Nations of the Americas Chapter of the\nAssociation for Computational Linguistics: Human\nLanguage Technologies (Volume 1: Long Papers),\npages 11926–11942, Albuquerque, New Mexico. As-\nsociation for Computational Linguistics.\nRuofan Wu, Youngwon Lee, Fan Shu, Danmei Xu,\nSeung-won Hwang, Zhewei Yao, Yuxiong He, and\nFeng Yan. 2025. ComposeRAG: A modular and com-\nposable RAG for corpus-grounded multi-hop ques-\ntion answering. arXiv preprint arXiv:2506.00232.\nChengrun Yang, Xuezhi Wang, Yifeng Lu, Hanxiao Liu,\nQuoc V. Le, Denny Zhou, and Xinyun Chen. 2024.\nLarge language models as optimizers. In Interna-\ntional Conference on Learning Representations.\nZhilin Yang, Peng Qi, Saizheng Zhang, Yoshua Bengio,\nWilliam Cohen, Ruslan Salakhutdinov, and Christo-\npher D. Manning. 2018. HotpotQA: A dataset for\ndiverse, explainable multi-hop question answering.\nIn Proceedings of the 2018 Conference on Empiri-\ncal Methods in Natural Language Processing, pages\n2369–2380, Brussels, Belgium. Association for Com-\nputational Linguistics.\nTian Yu, Shaolei Zhang, and Yang Feng. 2024.\nAuto-RAG: Autonomous retrieval-augmented gen-\neration for large language models. arXiv preprint\narXiv:2411.19443.\nA\nQuestion taxonomy and exam samples\nThis appendix complements the exam-generation\npipeline in Section 3.2 by listing the seven ques-\ntion types the Composer draws from and showing\none representative item per type. The examples\ncome from the 100-question exam the optimizer\ngenerated for the UniDoc healthcare corpus, the\none experiment where the generated exam is the op-\ntimization target. The Accuracy experiment instead\noptimizes against each benchmark’s own held-in\nquestions and generates no exam, so this appendix\ndocuments the pipeline where it runs.\nA.1\nQuestion types\nThe Composer assigns one type per question from\na fixed taxonomy of seven question types defined\na priori. The taxonomy extends the bridge and\ncomparison split of HotpotQA (Yang et al., 2018)\nwith numeric and inference variants common to\nmulti-hop benchmarks such as MuSiQue (Trivedi\net al., 2022).\nExtraction. A factoid lookup answerable from a\nsingle span.\nDefinitional. A short definition or description the\nchunk states explicitly.\nNumeric (single-span). Computes a value not\nstated verbatim by combining at least two nu-\nmeric literals inside one span (sum, difference,\nrange, median, count).\nInference. Composes facts from at least two dis-\ntinct spans into an answer that is not a contigu-\nous substring (causal chain, implicit-referent\nresolution, qualitative direction from quantita-\ntive facts).\nBridge. References an entity in one chunk via\nan indirect descriptor that another chunk\nuniquely identifies, then asks for an attribute\nof that entity.\nComparison. Reads a comparable value from\neach cited chunk and returns the relation\n(which is larger, by how much).\nNumeric (multi-span). Computes across cited\nspans: difference, sum, ratio, duration.\nBoth numeric types also carry an arithmetic for-\nmula. The Composer must supply it alongside the\nanswer, and the validator rejects the question when\nthe formula does not evaluate to the canonical an-\nswer. This guards against arithmetic mistakes by\nthe Composer LLM.\nSource spans.\nEach source span is the minimal\nexcerpt the answer strictly depends on, usually a\nsingle sentence. A span carries none of the sur-\nrounding context, so the example spans below can\nbe hard to read on their own. Each records only\nthe exact text a pipeline must retrieve, not the con-\ntext that explains the answer. Retrieval counts as\nsuccessful for a question only when the retrieved\nchunks contain all of its spans, and the per-question\ndiagnosis uses this test to attribute a failure to weak\nretrieval rather than weak generation.\nDistribution on UniDoc.\nTable 3 reports the type\ndistribution of the 100 questions that survive valida-\ntion and probe-based selection on UniDoc. Extrac-\ntion is well represented (16): the documents state\nmany specific facts buried in long, multi-section\ntext that are not trivially retrievable. Definitional\nquestions do not survive selection, and only one\nsingle-span numeric question does, because most\nnumeric reasoning here combines values that sit in\n11\n"
+    },
+    {
+      "title": "Grounded exam examples",
+      "page": 12,
+      "text": "Question type\nCount\nExtraction\n16\nDefinitional\n0\nNumeric (single-span)\n1\nInference\n25\nBridge\n19\nComparison\n25\nNumeric (multi-span)\n14\nTotal\n100\nTable 3: Question-type distribution of the 100-question\nUniDoc exam.\ndifferent spans. The exam also stays within docu-\nments: 98 questions keep all their spans within one\ndocument, and only 2 cross into a second.\nA.2\nExample questions\nOne representative item per surviving type, drawn\nverbatim from the UniDoc exam. Source spans are\nreproduced as written.\nExtraction\nQuestion. What fraction of European American hap-\nlotypes in the registry are represented by only one\nindividual?\nAnswer. 44.65% (variant: “44.65 percent”).\nSource span. “Application of our estimator to 6.59\nmillion donors in the Be The Match Registry revealed\nthat haplotypes follow a heavy tail distribution across\nall ethnicities: for example, 44.65% of the European\nAmerican haplotypes are represented by only 1 indi-\nvidual.”\nNumeric (single-span)\nQuestion. What is the average CK-MB value across\nboth cattle cases with tropical theileriosis?\nAnswer. 362.5 U/L.\nFormula. (344 + 381)/2 = 362.5.\nSource span. “CK-MB, Table 2. Biochemical find-\nings of two cases.Unit = (U/L). CK-MB, Case-1 =\n344. CK-MB, Case-2 = 381. CK-MB, Referance\nRange* = 189-235 **.”\nInference\nQuestion.\nWhy does the commercial Indian an-\ntivenom show limited efficacy against the newly dis-\ncovered krait species from Southern India?\nAnswer.\nAntivenom is manufactured from B.\ncaeruleus venom, not from the new species (variant:\n“because it is made from B. caeruleus venom”).\nSource spans.\n“Considering the near countrywide distribution of this\nclinically important snake, B. caeruleus venoms are\nused for the manufacture of commercial Indian poly-\nvalent antivenoms.”\n“While both antivenoms recognised the venoms of B.\ncaeruleus (titre: 1:500; PSVPL: 1.02 Optical Den-\nsity (OD); Haffkine: 0.89 OD) and B. sindanus (titre:\n1:500; PSVPL: 0.89 OD; Haffkine: 0.76 OD) rela-\ntively well, they exhibited limited to poor recogni-\ntion potential against the venom of B. romulusi (titre:\n1:500; PSVPL: 0.24 OD; Haffkine: 0.25 OD).”\nBridge\nQuestion. For the treatment comparison that showed\na statistically significant difference in adverse reac-\ntions (p < 0.001), what was the male-to-female ratio\nin each arm?\nAnswer. 59:7 (variant: “59/7”).\nSource spans.\n“Male/female ratio, Group I (Budesonide 400 mcg\nplus Formoterol 6 mcg) = 59/7. Male/female ratio,\nGroup II (Tiotropium 18 mcg plus Formoterol 12\nmcg) = 59/7.”\n“In group I, following adverse drug reactions were\nobserved; sore throat, hoarseness of voice, oral ulcers,\ntremors, 2 patients showed acute exacerbation and\n1 had pneumonitis. In group II, following adverse\ndrug reactions were observed; dryness of mouth, pal-\npitations, tremors and 2 patients developed urinary\nretention. After that we have done Fisher’s exact test\nand we observed that there is statistically significant\ndifference (p < 0.001) between group I and group\nII.”\nComparison\nQuestion. How did particle concentration change\nwhen antibodies were added without magnetic beads,\ncompared to when uncoated beads were used?\nAnswer. Increased by 105% versus no change (vari-\nant: “rose by 105% versus unchanged”).\nSource spans.\n“We applied an identical bead procedure, except that\nwe abstained from coating the beads with anti-ApoB\nantibodies prior to the incubation with the diluted PFP\nsample. This resulted in no changes in particle con-\ncentration and size distribution curve.”\n“we conducted a parallel experiment with a two-hour\nincubation of diluted PFP with 10 µg of anti-ApoB an-\ntibodies that had not been attached to magnetic beads,\nwhich resulted in an increase in particle concentra-\ntion by 105% as well as a notable shift of the size\ndistribution curve to the right”\nNumeric (multi-span)\nQuestion. What is the ratio of items to care-plan do-\nmains in the interRAI Mental Health assessment?\nAnswer. 19.8 items per domain (variant: “approxi-\nmately 20 items per domain”).\nFormula. 396/20 = 19.8.\nSource spans.\n“The interRAI Mental Health (MH) assessment (157,\n158) supports care plan development in 20 domains,\nand is used in in-patient mental health settings”\n“The assessment is comprised of 396 items in several\ndomains (see Table 1).”\n12\n"
+    },
+    {
+      "title": "Complete search-space configuration",
+      "page": 13,
+      "text": "B\nSearch space\nThe search space is one of the inputs the user sup-\nplies to the optimizer, alongside the corpus. It\nis a single YAML file (Listing 1) that names the\ncorpus, the models that drive the optimizer, the\nexam-generation settings, and the dimensions to\nsearch. The optimizer reads this file directly, so the\nsearch space is fully specified and auditable before\nany trial runs.\nListing 1 shows the configuration for the Pareto\nexperiment on UniDoc, where the optimizer gen-\nerates and scores its own exam. The Accuracy ex-\nperiment, on HotpotQA, MuSiQue, and MultiHop-\nRAG, shares the same search_space and differs\nonly in its exam source, cost mode, and parsing,\neach described below. Those runs supply each\nbenchmark’s own held-in questions as the valida-\ntion exam through examiner.custom_exam_path\nand generate none, so the examiner block in the\nlisting does not apply to them. They also run score-\nonly rather than cost-aware, and they parse pre-\nextracted text with OCR and table-structure extrac-\ntion off. UniDoc, built from real PDFs and page\nimages, turns both on, sets cost_aware to true,\nand weights the exam-generation neighborhoods\ntoward same-document siblings (0.8 / 0.2) be-\ncause its documents are long and multi-section.\n# Project configuration: corpus, optimizer models, exam\n# settings, and the search space. Provided by the user.\nmeta:\nproject_name: unidoc-pareto\ncorpus_path: ./corpus\n# free-text hint read by the optimizer\ncorpus_description: |\nReal-world healthcare PDFs and scanned page images:\ninsurance forms, claims, clinical notes. Dense,\ndomain-specific prose with tables and mixed layouts.\nmax_trials: 30\n# search budget\ncost_aware: true\n# Pareto run; the Accuracy experiment\nsets false\nmodel_aliases:\n# map names to your deployments\nazure/gpt-5-nano:\n<your-deployment>\nazure/gpt-5-mini:\n<your-deployment>\nazure/gpt-4.1-nano: <your-deployment>\nazure/gpt-4.1-mini: <your-deployment>\n# LLMs that drive the optimizer and grade answers\nagent:\noptimizer_model: kimi-k2.5\n# diagnose + propose\nexaminer_model:\nminimax-m2.5\n# compose exam\njudge_model:\nDeepSeek-V3.2\n# grade answers\noptimizer_reasoning_effort: medium\nexaminer_reasoning_effort: medium\nexaminer:\n# exam generation (skipped when an exam is\nsupplied)\nexam_size: 100\n# seed this x exam_size neighborhoods; the composer\n# over-generates questions, then filter to exam_size\ninitial_question_multiplier: 1.8\nprobe_selection: true\n# keep discriminative items\nneighborhood_min_chunks: 18\n# context per call\nneighborhood_min_words: 5000\n# neighborhood mix, favoring same-document spans\nneighborhood_same_doc_weight: 0.8\nneighborhood_cross_doc_weight: 0.2\nparsing:\n# OCR + tables on for the UniDoc PDFs\nparser: docling\nocr: true\ntable_structure: true\nsearch_space:\n# dimensions searched\nchunking:\n# how documents are split\nstrategies: [recursive, fixed]\nchunk_token_size: [128, 256, 384, 512]\nchunk_token_overlap: [0, 32, 48, 64]\nembedding:\n# 13 retrievers\nmodels:\n- IEITYuan/Yuan-embedding-2.0-en\n- Qwen/Qwen3-Embedding-0.6B\n- ibm-granite/granite-embedding-english-r2\n- ibm-granite/granite-embedding-small-english-r2\n- intfloat/e5-large-v2\n- intfloat/multilingual-e5-large-instruct\n- BAAI/bge-large-en-v1.5\n- BAAI/bge-small-en-v1.5\n- BAAI/bge-m3\n- Snowflake/snowflake-arctic-embed-l-v2.0\n- Snowflake/snowflake-arctic-embed-xs\n- mixedbread-ai/mxbai-embed-large-v1\n- sentence-transformers/all-MiniLM-L6-v2\nretrieval:\nindex_types: [vector_only, hybrid_bm25_vector]\ntop_k: { min: 3, max: 20 }\n# retrieved chunks\nhybrid_alpha: { min: 0.0, max: 1.0 }\n# lexical/dense\nbm25_vector_fusion: [alpha, rrf]\nlong_context_reorder: [false, true]\nquery_expansion:\nstrategies: [none, hyde, multi_query, query_decompose]\nmodels: [azure/gpt-4o-mini]\n# fixed expander\nreranker:\nmodels:\n- none\n- BAAI/bge-reranker-v2-m3\n- cross-encoder/ms-marco-MiniLM-L-6-v2\n- Alibaba-NLP/gte-reranker-modernbert-base\n- mixedbread-ai/mxbai-rerank-xsmall-v1\ntop_n: { min: 3, max: 10 }\n# reranked chunks\ngenerator:\n# 35 answer LLMs\nmodels:\n- bedrock/us.amazon.nova-micro-v1:0\n- bedrock/us.amazon.nova-lite-v1:0\n- bedrock/us.amazon.nova-pro-v1:0\n- bedrock/google.gemma-3-4b-it\n- bedrock/google.gemma-3-12b-it\n- bedrock/google.gemma-3-27b-it\n- bedrock/us.meta.llama3-1-8b-instruct-v1:0\n- bedrock/us.meta.llama3-3-70b-instruct-v1:0\n- bedrock/us.meta.llama4-scout-17b-instruct-v1:0\n- bedrock/us.meta.llama4-maverick-17b-instruct-v1:0\n- bedrock/mistral.magistral-small-2509\n- bedrock/mistral.ministral-3-3b-instruct\n- bedrock/mistral.ministral-3-8b-instruct\n- bedrock/mistral.ministral-3-14b-instruct\n- bedrock/mistral.mistral-7b-instruct-v0:2\n- bedrock/mistral.mistral-large-3-675b-instruct\n- bedrock/mistral.mixtral-8x7b-instruct-v0:1\n- bedrock/nvidia.nemotron-nano-3-30b\n- bedrock/openai.gpt-oss-20b-1:0\n- bedrock/openai.gpt-oss-120b-1:0\n- bedrock/qwen.qwen3-32b-v1:0\n- bedrock/qwen.qwen3-coder-30b-a3b-v1:0\n- bedrock/zai.glm-4.7\n- azure/gpt-4o\n- azure/gpt-4o-mini\n- azure/gpt-4.1-mini\n- azure/gpt-4.1-nano\n- azure/o4-mini\n- azure/gpt-5-mini\n- azure/gpt-5-nano\n- azure/gpt-5.4-mini\n- azure/gpt-5.4-nano\n- vertex_ai/gemini-2.5-flash\n- vertex_ai/gemini-2.5-flash-lite\n- vertex_ai/gemini-3.1-flash-lite-preview\n# when true, trials may use reasoning or plain models,\n13\n"
+    },
+    {
+      "title": "Configuration continuation and knowledge sources",
+      "page": 14,
+      "text": "# passing reasoning params to LiteLLM where supported\nreasoning: true\nreasoning_effort: medium\n# when reasoning is on\ntemperature: { min: 1.0, max: 1.0 }\nListing 1:\nProject configuration for the Pareto\nexperiment on UniDoc, the file the user supplies to the\noptimizer. The Accuracy experiment shares the same\nsearch_space but supplies its own held-in exam and\nruns score-only.\nC\nKnowledge base\nAppendix B names the candidate models. This ap-\npendix shows the annotations the Proposer reasons\nover for each one. The knowledge base pairs every\nmodel in the search space with public benchmark\nscores, per-token pricing, and serving attributes,\nwhich lets the Proposer rank candidates and rule\nout quality-cost-dominated choices before it spends\na trial on them. LLM benchmarks and throughput\ncome from Artificial Analysis,3 embedding and\nreranker rankings from the MTEB (Muennighoff\net al., 2023), MMTEB (Enevoldsen et al., 2025),\nand FollowIR (Weller et al., 2025) benchmarks,\nand per-token pricing from LiteLLM.4 The opti-\nmizer renders the knowledge base filtered to the\nconfigured search space and to the run’s reasoning-\neffort setting, so a model that supports reasoning\ncan appear as two entries, one reasoning and one\nnon-reasoning, with different scores. The 35 gener-\nator models of Appendix B therefore render as 49\nscored entries.\nTables 4, 5, and 6 report the generator, embed-\nding, and reranker annotations. The embedding\nand reranker tables are complete, whereas for gen-\nerators we show twelve models spanning the intel-\nligence range. The Proposer treats these scores as\ncomparative signal, not ground truth.\nThe scores are a point-in-time snapshot, taken\nin May 2026 for the LLM benchmarks and pricing\nand from the MTEB(eng, v2) leaderboard for the\nembedders.\n3https://artificialanalysis.ai/\n4https://github.com/BerriAI/litellm\n14\n"
+    },
+    {
+      "title": "Knowledge-base tables",
+      "page": 15,
+      "text": "Model\nCreator\nIntel.\nGPQA\nIFBench\nIn $/M\nOut $/M\nTok/s\nReasoning\nglm-4.7\nZ AI\n42.1\n0.859\n0.679\n0.60\n2.20\n86\nYes\ngpt-5-mini\nOpenAI\n38.9\n0.803\n0.712\n0.25\n2.00\n106\nYes\ngpt-5.4-mini\nOpenAI\n37.7\n0.823\n0.648\n0.75\n4.50\n172\nYes\ngpt-oss-120b\nOpenAI\n33.3\n0.782\n0.690\n0.15\n0.60\n289\nYes\ngemini-2.5-flash\nGoogle\n27.0\n0.790\n0.503\n0.30\n2.50\n225\nYes\ngpt-5-nano\nOpenAI\n25.9\n0.670\n0.659\n0.05\n0.40\n151\nYes\ngpt-4.1-mini\nOpenAI\n22.9\n0.664\n0.383\n0.40\n1.60\n80\nNo\nmistral-large-3\nMistral\n22.8\n0.680\n0.362\n0.50\n1.50\n58\nNo\nllama4-maverick\nMeta\n18.4\n0.671\n0.430\n0.24\n0.97\n122\nNo\ngpt-4o\nOpenAI\n17.3\n0.543\n0.343\n2.50\n10.00\n172\nNo\nnova-micro\nAmazon\n10.3\n0.358\n0.294\n0.04\n0.14\n318\nNo\ngemma-3-4b\nGoogle\n6.3\n0.291\n0.283\n0.04\n0.08\n–\nNo\nTable 4: Generator-LLM annotations in the knowledge base, a twelve-model slice across the intelligence range (the\nfull set of 35 models, which render as 49 reasoning and non-reasoning entries, is named in Appendix B). Intel. is the\nArtificial Analysis intelligence index. GPQA (Rein et al., 2024) and IFBench (Pyatkin et al., 2025) are accuracies in\n[0, 1]. Prices are USD per million input and output tokens. Tok/s is median output throughput. Reasoning marks\nwhich variant the listed scores describe. Model names abbreviate the LiteLLM identifiers in Appendix B, and a\ndash marks a value unpublished in the snapshot.\nModel\nDim.\nMax tok.\nParams (B)\nRetrieval\nSTS\nRerank.\nMem. (MB)\nYuan-embedding-2.0-en\n1024\n2048\n0.596\n0.707\n0.849\n0.533\n2272\nQwen3-Embedding-0.6B\n1024\n32768\n0.596\n0.618\n0.858\n0.482\n1136\nsnowflake-arctic-embed-l-v2.0\n1024\n8192\n0.568\n0.586\n0.770\n0.475\n2166\ngranite-embedding-english-r2\n768\n8192\n0.149\n0.564\n0.781\n0.491\n284\nmxbai-embed-large-v1\n1024\n512\n0.335\n0.556\n0.772\n0.480\n639\nbge-large-en-v1.5\n1024\n512\n0.335\n0.554\n0.759\n0.483\n1242\ngranite-embedding-small-english-r2\n384\n8192\n0.048\n0.539\n0.766\n0.476\n91\nbge-small-en-v1.5\n512\n512\n0.033\n0.539\n0.739\n0.469\n127\nmultilingual-e5-large-instruct\n1024\n514\n0.560\n0.535\n0.843\n0.487\n1068\nsnowflake-arctic-embed-xs\n384\n512\n0.023\n0.526\n0.728\n0.453\n86\nbge-m3\n1024\n8194\n0.568\n0.510\n0.799\n–\n2167\ne5-large-v2\n1024\n514\n0.335\n0.493\n0.749\n0.457\n1278\nall-MiniLM-L6-v2\n384\n256\n0.023\n0.430\n0.704\n0.471\n87\nTable 5: The 13 embedding models in the search space with their MTEB(eng, v2) (Muennighoff et al., 2023)\nscores. Retrieval, STS, and reranking (Rerank.) are the corresponding MTEB task scores in [0, 1]. Dim. is the\nembedding dimension, Max tok. the maximum input length, Params (B) the parameter count in billions, and Mem.\nthe memory footprint. The Proposer ranks retrievers by the Retrieval score. Names drop the organization prefix\nlisted in Appendix B, and a dash marks a value unpublished in the snapshot.\nModel\nParams (B)\nMTEB-R\nMMTEB-R\nFollowIR\nbge-reranker-v2-m3\n0.6\n0.570\n0.584\n−0.01\nms-marco-MiniLM-L-6-v2\n0.022\n–\n–\n–\ngte-reranker-modernbert-base\n–\n–\n–\n–\nmxbai-rerank-xsmall-v1\n–\n–\n–\n–\nTable 6: The four reranker models in the search space (a fifth option, none, disables reranking). MTEB-R and\nMMTEB-R are the MTEB (Muennighoff et al., 2023) and MMTEB (Enevoldsen et al., 2025) reranking-task scores\nin [0, 1], and FollowIR (Weller et al., 2025) is the instruction-following retrieval score. Coverage is sparse, with\npublished scores for only one of the four rerankers in the snapshot, so the Proposer has little benchmark signal here\nand relies on rerank depth and downstream accuracy. Names abbreviate the identifiers in Appendix B, and a dash\nmarks a value unpublished in the snapshot.\n15\n"
+    },
+    {
+      "title": "Search cost and embedding compute",
+      "page": 16,
+      "text": "Figure 4: Search cost and embedding compute on the three datasets of the Accuracy experiment. Bars show the\nmean over the 10 search seeds and whiskers span ±1 standard deviation across seeds. In the search-cost panel\neach bar splits into optimizer reasoning (the agent’s Proposer and Diagnoser calls) and trial evaluation (the RAG\ngeneration and judge scoring at each trial). Random search and MO-TPE propose configurations without a language\nmodel, so their cost is entirely trial evaluation. The embedding panel counts embedding-input tokens in millions,\none charge per distinct embedder and chunk-size configuration rather than per trial.\nD\nSearch cost and embedding compute\nFigure 4 reports two costs of running each opti-\nmizer on the three datasets of the Accuracy experi-\nment, the dollar cost of the search and the embed-\nding compute it consumes. We count the latter as\nembedding-input tokens, charged once per distinct\nembedder and chunk-size configuration, since each\nindex is built once and reused across a run’s tri-\nals. Bars are the mean over the 10 search seeds\nand whiskers span ±1 standard deviation across\nseeds. The methods differ most on embedding to-\nkens used. The agent’s search consumes 11 to 16M\nembedding tokens per dataset, against 46 to 79M\nfor random search and 34 to 63M for MO-TPE,\nthree to five times fewer. Guided by the knowledge\nbase, it settles on a few strong embedders early and\nreuses their cached indexes, while random search\nand MO-TPE sample embedders and chunk sizes\nacross the whole space and pay for a fresh index\nbuild on each new combination.\nIn dollars the methods are closer, and the full\n30-trial agent costs more than the statistical base-\nlines. The gap is trial evaluation, not reasoning.\nIts Proposer and Diagnoser calls add only $0.71 to\n$0.79 per run, while random search and MO-TPE\nchoose configurations without a language model\nand spend nothing on reasoning. What raises the\nagent’s bill is the pipelines it evaluates. These are\nscore-only runs, so cost is not an objective and noth-\ning steers the agent toward cheaper generators. It\nknows from the knowledge base and the language\nmodel’s own priors which generators are strong,\nand strong generators tend to cost more per token,\nso its trials favor more capable, more expensive\nconfigurations. However, reaching their accuracy\ndoes not take the full budget. Its 10-trial checkpoint\nrecovers most of the agent’s final held-out accuracy\n(Table 2) at $1.48 to $2.92 per run, comparable to\nrandom search and MO-TPE at $1.86 to $4.45.\n16\n"
+    }
+  ],
+  "references": [
+    "Judge dependence.\nAccuracy in both experi-\nments is scored by an LLM judge, and we run\nno human-agreement study, so any systematic bias\nin the judge carries into the numbers we report.",
+    "Richer cross-document bridges.\nOur exam\npipeline ranks bridges by lexical TF-IDF similarity,\nwhich connects only chunks that share rare surface\nterms. An entity-relation graph over the corpus,\nas in graph-based RAG (Edge et al., 2024), would\nalso surface bridges that share an entity but not its\nwording.",
+    "Expanding the search space.\nThe diagnose-\nthen-propose loop is agnostic to what the search\nspace contains, so it can tune richer pipeline fam-\nilies than the modular flow we search here. Sup-\nporting whole architectures, such as agentic RAG\nor graph-based RAG, would let it search across\nretrieval paradigms rather than within one.",
+    "More objectives.\nThe optimizer weighs only ac-\ncuracy and cost today, and its knowledge base al-\nready records throughput and memory, so latency\nor memory footprint are natural additions.",
+    "Warm starts across runs.\nEach run begins cold\non a new corpus. Carrying diagnoses and config-\nuration priors across runs would let it start warm,\naccumulating an agent memory the optimizer re-\ntrieves from to generalize what it learns about RAG\nconfiguration from one corpus to the next.",
+    "This work was carried out at the ETH Agentic Sys-\ntems Lab. We thank David Schaurecker for provid-\ning API credits to support the LLM usage.",
+    "Takuya Akiba, Shotaro Sano, Toshihiko Yanase, Takeru\nOhta, and Masanori Koyama. 2019. Optuna: A next-\ngeneration hyperparameter optimization framework.\nIn Proceedings of the 25th ACM SIGKDD Interna-\ntional Conference on Knowledge Discovery & Data\nMining, pages 2623–2631.",
+    "Akari Asai, Zeqiu Wu, Yizhong Wang, Avirup Sil, and\nHannaneh Hajishirzi. 2024. Self-RAG: Learning to\nretrieve, generate, and critique through self-reflection.\nIn International Conference on Learning Representa-\ntions.",
+    "Christoph Auer, Maksym Lysak, Ahmed Nassar,\nMichele Dolfi, Nikolaos Livathinos, Panos Vage-\nnas, Cesar Berrospi Ramis, Matteo Omenetti, Fabian\nLindlbauer, Kasper Dinkla, Lokesh Mishra, Yusik\nKim, Shubham Gupta, Rafael Teixeira de Lima,\nValery Weber, Lucas Morin, Ingmar Meijer, Viktor\nKuropiatnyk, and Peter W. J. Staar. 2024. Docling\ntechnical report. arXiv preprint arXiv:2408.09869.",
+    "Matthew Barker, Andrew Bell, Evan Thomas, James\nCarr, Thomas Andrews, and Umang Bhatt. 2025.\nFaster, cheaper, better: Multi-objective hyperparame-\nter optimization for LLM and RAG systems. In ICLR\n2025 Workshop on Foundation Models in the Wild.",
+    "Alexander Conway, Debadeepta Dey, Stefan Hackmann,\nMatthew Hausknecht, Michael Douglas Schmidt,\nMark Lewis Steadman, and Nick Volynets. 2025.\nsyftr: Pareto-optimal generative AI. In Proceedings\nof the Fourth International Conference on Automated\nMachine Learning, volume 293 of Proceedings of\nMachine Learning Research, pages 6/1–33. PMLR.",
+    "Darren Edge, Ha Trinh, Newman Cheng, Joshua\nBradley, Alex Chao, Apurva Mody, Steven Truitt,\nDasha Metropolitansky, Robert Osazuwa Ness, and\nJonathan Larson. 2024. From local to global: A\ngraph RAG approach to query-focused summariza-\ntion. arXiv preprint arXiv:2404.16130.",
+    "Kenneth Enevoldsen, Isaac Chung, Imene Kerboua,\nMárton Kardos,\nAshwin Mathur,\nDavid Stap,\nJay Gala, Wissam Siblini, Dominik Krzemi´nski,\nGenta Indra Winata, Saba Sturua, Saiteja Utpala, et al.\n2025. MMTEB: Massive multilingual text embed-\nding benchmark. In International Conference on\nLearning Representations (ICLR).",
+    "Simone Filice, Guy Horowitz, David Carmel, Zohar\nKarnin, Liane Lewin-Eytan, and Yoelle Maarek.\n2025. Generating Q&A benchmarks for RAG evalua-\ntion in enterprise settings. In Proceedings of the 63rd\nAnnual Meeting of the Association for Computational\nLinguistics (Volume 6: Industry Track), pages 469–\n484, Vienna, Austria. Association for Computational\nLinguistics.",
+    "Jia Fu, Xiaoting Qin, Fangkai Yang, Lu Wang, Jue\nZhang, Qingwei Lin, Yubo Chen, Dongmei Zhang,\nSaravan Rajmohan, and Qi Zhang. 2024. AutoRAG-\nHP: Automatic online hyper-parameter tuning for\nretrieval-augmented generation. In Findings of the\nAssociation for Computational Linguistics: EMNLP\n2024, pages 3875–3891, Miami, Florida, USA. Asso-\nciation for Computational Linguistics.",
+    "Yunfan Gao, Yun Xiong, Xinyu Gao, Kangxiang Jia,\nJinliu Pan, Yuxi Bi, Yi Dai, Jiawei Sun, Qianyu Guo,\nMeng Wang, and Haofen Wang. 2023. Retrieval-\naugmented generation for large language models: A\nsurvey. arXiv preprint arXiv:2312.10997.",
+    "Gauthier Guinet, Behrooz Omidvar-Tehrani, Anoop De-\noras, and Laurent Callot. 2024. Automated evalu-\nation of retrieval-augmented language models with",
+    "task-specific exam generation. In Proceedings of the\n41st International Conference on Machine Learning,\nvolume 235 of Proceedings of Machine Learning\nResearch, pages 16773–16801. PMLR.",
+    "Sture Holm. 1979. A simple sequentially rejective mul-\ntiple test procedure. Scandinavian Journal of Statis-\ntics, 6(2):65–70.",
+    "Muhammed Yusuf Kartal, Suha Kagan Kose, Ko-\nrhan Sevinç, and Burak Aktas. 2025. RAGSmith:\nA framework for finding the optimal composition\nof retrieval-augmented generation methods across\ndatasets. arXiv preprint arXiv:2511.01386.",
+    "Dongkyu Kim, Byoungwook Kim, Donggeon Han, and\nMatouš Eibich. 2024. AutoRAG: Automated frame-\nwork for optimization of retrieval augmented genera-\ntion pipeline. arXiv preprint arXiv:2410.20878.",
+    "Yongqi Leng, Yikun Lei, Xikai Liu, Meizhi Zhong,\nBojian Xiong, Yurong Zhang, Yan Gao, Yi Wu, Yao\nHu, and Deyi Xiong. 2025. DecEx-RAG: Boosting\nagentic retrieval-augmented generation with decision\nand execution optimization via process supervision.\nIn Proceedings of the 2025 Conference on Empirical\nMethods in Natural Language Processing: Industry\nTrack, pages 1412–1425, Suzhou, China. Association\nfor Computational Linguistics.",
+    "Patrick Lewis, Ethan Perez, Aleksandra Piktus, Fabio\nPetroni, Vladimir Karpukhin, Naman Goyal, Hein-\nrich Küttler, Mike Lewis, Wen-tau Yih, Tim Rock-\ntäschel, Sebastian Riedel, and Douwe Kiela. 2020.\nRetrieval-augmented generation for knowledge-\nintensive NLP tasks. In Advances in Neural Infor-\nmation Processing Systems, volume 33, pages 9459–\n9474.",
+    "Siyi Liu, Chen Gao, and Yong Li. 2025. AgentHPO:\nLarge language model agent for hyper-parameter op-\ntimization. In Proceedings of the Conference on Par-\nsimony and Learning, volume 280 of Proceedings\nof Machine Learning Research, pages 1146–1169.\nPMLR.",
+    "Henry B. Mann and Donald R. Whitney. 1947. On\na test of whether one of two random variables is\nstochastically larger than the other. The Annals of\nMathematical Statistics, 18(1):50–60.",
+    "Niklas Muennighoff, Nouamane Tazi, Loïc Magne, and\nNils Reimers. 2023. MTEB: Massive text embedding\nbenchmark. In Proceedings of the 17th Conference\nof the European Chapter of the Association for Com-\nputational Linguistics, pages 2014–2037, Dubrovnik,\nCroatia. Association for Computational Linguistics.",
+    "Matan Orbach, Ohad Eytan, Benjamin Sznajder, Ariel\nGera, Odellia Boni, Yoav Kantor, Gal Bloch,\nOmri Levy, Hadas Abraham, Nitzan Barzilay, Eyal\nShnarch, Michael E. Factor, Shila Ofek-Koifman,\nPaula Ta-Shma, and Assaf Toledo. 2026. An anal-\nysis of hyper-parameter optimization methods for\nretrieval augmented generation. In AAAI 2026 Work-\nshop on New Frontiers in Information Retrieval.",
+    "Xiangyu Peng, Can Qin, Zeyuan Chen, Ran Xu, Caim-\ning Xiong, and Chien-Sheng Wu. 2025. UniDoc-\nBench: A unified benchmark for document-centric\nmultimodal RAG. arXiv preprint arXiv:2510.03663.",
+    "Valentina Pyatkin, Saumya Malik, Victoria Graf,\nHamish Ivison, Shengyi Huang, Pradeep Dasigi,\nNathan Lambert, and Hannaneh Hajishirzi. 2025.\nGeneralizing verifiable instruction following. In Ad-\nvances in Neural Information Processing Systems\n(NeurIPS), Datasets and Benchmarks Track.",
+    "David Rein, Betty Li Hou, Asa Cooper Stickland, Jack-\nson Petty, Richard Yuanzhe Pang, Julien Dirani, Ju-\nlian Michael, and Samuel R. Bowman. 2024. GPQA:\nA graduate-level google-proof q&a benchmark. In\nConference on Language Modeling (COLM).",
+    "Jon Saad-Falcon, Omar Khattab, Christopher Potts, and\nMatei Zaharia. 2024. ARES: An automated evalua-\ntion framework for retrieval-augmented generation\nsystems. In Proceedings of the 2024 Conference of\nthe North American Chapter of the Association for\nComputational Linguistics: Human Language Tech-\nnologies (Volume 1: Long Papers), pages 338–354,\nMexico City, Mexico. Association for Computational\nLinguistics.",
+    "Sumuk Shashidhar, Clémentine Fourrier, Alina Lo-\nzovskaya, Thomas Wolf, Gokhan Tur, and Dilek\nHakkani-Tür. 2025. Yourbench: Dynamic evalua-\ntion set generation with LLMs. In Conference on\nLanguage Modeling (COLM).",
+    "Aditi Singh, Abul Ehtesham, Saket Kumar, Tala Ta-\nlaei Khoei, and Athanasios V. Vasilakos. 2025. Agen-\ntic retrieval-augmented generation: A survey on agen-\ntic RAG. arXiv preprint arXiv:2501.09136.",
+    "Yixuan Tang and Yi Yang. 2024.\nMultiHop-RAG:\nBenchmarking retrieval-augmented generation for\nmulti-hop queries. In Conference on Language Mod-\neling (COLM).",
+    "Patara Trirat, Wonyong Jeong, and Sung Ju Hwang.\n2025. AutoML-Agent: A multi-agent LLM frame-\nwork for full-pipeline AutoML. In Proceedings of the\n42nd International Conference on Machine Learn-\ning, volume 267 of Proceedings of Machine Learning\nResearch, pages 60099–60146. PMLR.",
+    "Harsh Trivedi, Niranjan Balasubramanian, Tushar Khot,\nand Ashish Sabharwal. 2022.\nMuSiQue: Multi-\nhop questions via single-hop question composition.\nTransactions of the Association for Computational\nLinguistics, 10:539–554.",
+    "Xiaohua Wang, Zhenghua Wang, Xuan Gao, Feiran\nZhang,\nYixin Wu,\nZhibo Xu,\nTianyuan Shi,\nZhengyuan Wang, Shizheng Li, Qi Qian, Ruicheng\nYin, Changze Lv, Xiaoqing Zheng, and Xuanjing\nHuang. 2024.\nSearching for best practices in\nretrieval-augmented generation. In Proceedings of\nthe 2024 Conference on Empirical Methods in Natu-\nral Language Processing, pages 17716–17736, Mi-\nami, Florida, USA. Association for Computational\nLinguistics."
+  ]
+}

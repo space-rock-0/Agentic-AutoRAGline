@@ -1,0 +1,289 @@
+# Agentic AutoRagline — full reference config
+#
+# Every supported field is listed here with its package default. Copy this
+# file and trim to what you need; missing sections fall back to the defaults
+# shown below. The starter (configs/starter_example.yaml) is the minimal
+# version of the same shape.
+#
+# Source of truth for fields and defaults: agentic_autorag/config/models.py.
+
+
+# ── model_aliases ──────────────────────────────────────────────────────────
+# Maps short names used in the search space and agent model fields to the
+# real LiteLLM model identifier called at runtime. Two value shapes:
+#
+#   simple   alias: "provider/deployment-name"
+#   extended alias: {model: "...", api_base: "...", api_key: "...", api_version: "..."}
+#
+# Omit entirely when every model in your config is reachable by its canonical
+# LiteLLM name. Most commonly used to map Azure Foundry deployment names
+# (e.g. ``gpt-4o-1``, ``gpt-4o-2``) onto canonical model names.
+model_aliases:
+  azure/gpt-4o-mini: azure/gpt-4o-mini-1
+
+
+# ── meta ───────────────────────────────────────────────────────────────────
+# Project-level settings. None of these are part of the search space.
+meta:
+  project_name: "unidoc-rag"
+  corpus_path: "./data/corpus/unidoc/"
+  corpus_description: |
+    UniDoc-Bench corpus: real-world enterprise healthcare PDFs and page
+    images. Single-domain; complex layouts (tables, figures, mixed text).
+  output_dir: "./experiments/unidoc/"
+  # Trial budget. The loop always runs to ``max_trials``.
+  max_trials: 30
+  # Upper bound for the ingredient cache (chunks + embeddings per
+  # chunker × embedder × corpus tuple). LRU evicts oldest when exceeded.
+  cache_max_gb: 5.0
+  # Optimization objective.
+  #   true:  two-objective (score up, cost down). The agent sees the Pareto
+  #          frontier, the report shows it, and the report model picks
+  #          recommended.yaml from the frontier.
+  #   false: single-objective (score only). Cost is still recorded for
+  #          post-hoc analysis but hidden from the agent's prompts, and
+  #          recommended.yaml is the top-accuracy trial. Use this for
+  #          score-only comparisons against other optimizers.
+  cost_aware: true
+  # Seed for the stratified failure sampler used to build deep-block
+  # evidence for the Diagnoser. ``null`` derives the seed from the trial
+  # number (deterministic per trial, varying across trials).
+  failure_sample_seed: null
+  # Lookback window (in trials) for the hypervolume-Δ surfaced in the
+  # cost-aware Pareto state card. Informational only — the agent reads it
+  # as a "is the frontier still expanding?" signal but the orchestrator
+  # does not gate termination on it.
+  hv_delta_window: 3
+  # Corpus pre-sampling — caps the parsed corpus at ``corpus_word_budget``
+  # words so re-embedding per trial stays bounded on large corpora. The
+  # sampler walks a deterministic shuffle of the file list and stops when
+  # the running word estimate hits the budget. PDFs are measured via
+  # PyMuPDF text extraction; text formats (.md/.txt/.html/.adoc/.csv) use
+  # a byte-count heuristic; unmeasurable formats (.docx, images, …) are
+  # included in the selection but contribute zero words. The selection is
+  # cached at ``<output_dir>/.cache/corpus_selection.json`` and invalidates when
+  # the listing hash or any of (word_budget, sample_seed) changes.
+  # Set ``corpus_word_budget: null`` to disable trimming entirely.
+  corpus_word_budget: 2_000_000
+  corpus_sample_seed: 42
+
+
+# ── parsing ────────────────────────────────────────────────────────────────
+# How raw files are converted to text before chunking. Not part of the
+# search space — set once per project. All formats (PDF, DOCX, XLSX, PPTX,
+# HTML, MD, TXT, AsciiDoc, CSV, images) go through Docling.
+parsing:
+  # The only supported parser. Surfaced here so it's visible at a glance;
+  # the validator rejects any other value.
+  parser: "docling"
+  ocr: true
+  table_structure: true
+  # Containment cutoff for near-duplicate detection: |A∩B| / min(|A|,|B|)
+  # over normalised token n-grams. 0.85 catches OCR-of-PDF page images
+  # even with ~12–15% n-gram divergence; raise toward 1.0 for stricter
+  # clustering. Detection emits metadata only; the corpus the optimizer
+  # evaluates against is never modified.
+  near_duplicate_threshold: 0.85
+  near_duplicate_detection_enabled: true
+
+
+# ── agent ──────────────────────────────────────────────────────────────────
+# LLMs that drive the reasoning loop (optimizer + examiner) and the
+# trial-time judge. Distinct from the per-stage LLM pools in
+# ``search_space.generator.models`` / ``search_space.passage_compressor.models`` /
+# ``search_space.query_expansion.models`` (which are the ones the optimizer
+# chooses between for the RAG pipeline).
+agent:
+  optimizer_model: "gemini/gemini-3-flash-preview"
+  examiner_model: "gemini/gemini-3-flash-preview"
+  # Reference model for the oracle answerability gate and the trial-time
+  # judge (grades free-form predictions when EM=0). Required. Pick one at
+  # least as strong as the generators in the search space.
+  judge_model: "gemini/gemini-3-flash-preview"
+  # Reasoning effort for optimizer LLM calls. Passed through to
+  # litellm.acompletion when the model supports it; silently dropped
+  # otherwise. Set to null to disable.
+  optimizer_reasoning_effort: "medium"
+  # Reasoning effort for examiner LLM calls (composition + single-hop
+  # probe).
+  examiner_reasoning_effort: "medium"
+  # Concurrency cap on parallel LLM calls. Lower if your provider rate-
+  # limits frequently (429s).
+  concurrency: 10
+
+
+# ── examiner ───────────────────────────────────────────────────────────────
+# The optimizer evaluates each trial against an exam of typed open-ended
+# questions grounded in the corpus. The exam is generated at the start of
+# the first run and cached as ``<meta.output_dir>/exam.json`` for reuse.
+examiner:
+  exam_size: 80
+  # Path to your own exam JSON. When set, generation is skipped and the run
+  # optimizes against these questions. See docs/custom_exam.md.
+  custom_exam_path: null
+  # Over-generate to absorb composition / probe / oracle rejections.
+  initial_question_multiplier: 1.5
+  # Discrimination filter over up to four probe pipelines. Disable only for
+  # tests / debugging.
+  probe_selection: true
+  # Persist exam-generation analysis artifacts (composition log, span
+  # verification, multi-hop rejections) to ``<meta.output_dir>/details/debug/``.
+  # On by default — they're how exam generation is inspected and tuned.
+  save_debug_artifacts: true
+  # Sampling temperature for the composition LLM. Default 1.0 because
+  # several frontier reasoning models require exactly this value.
+  composition_temperature: 1.0
+
+  # --- Neighborhood builder ---
+  # The composer sees a NEIGHBORHOOD per call: the anchor chunk, chunks from
+  # the same document, and lexically similar chunks from other documents.
+  # The neighborhood grows until it has neighborhood_min_chunks chunks OR
+  # neighborhood_min_words words, whichever comes first. The two weights
+  # split the extra slots between the anchor's document and other documents
+  # (normalized, so 0.8/0.2 equals 4/1). They control only what the composer
+  # sees, not how many cross-document questions survive. See
+  # docs/exam_generation.md before changing them.
+  neighborhood_min_chunks: 12
+  neighborhood_min_words: 5000
+  neighborhood_same_doc_weight: 0.8
+  neighborhood_cross_doc_weight: 0.2
+
+  # Source span / chunk-relevance verification thresholds.
+  source_fact_verify_fuzzy_threshold: 0.9
+  chunk_relevance_min_overlap_chars: 50
+  chunk_relevance_ngram_size: 5
+  chunk_relevance_overlap_threshold: 0.5
+  chunk_relevance_min_run: 5
+
+  # Exam-pipeline chunker (separate from per-trial retrieval chunking).
+  # ``max_chunk_words`` is the per-chunk word budget HybridChunker enforces
+  # via a word-count tokenizer — smaller produces finer-grained chunks.
+  # ``min_doc_words`` skips short docs entirely.
+  max_chunk_words: 1000
+  min_doc_words: 200
+
+  # Section classifier — chunk pairing SKIPS chunks whose label appears
+  # below. Valid labels: body, abstract, methods, results, discussion,
+  # references, acknowledgments, author_info.
+  excluded_section_types:
+    - references
+    - acknowledgments
+    - author_info
+
+
+# ── search_space ───────────────────────────────────────────────────────────
+# The tunable parameters the optimizer searches over, grouped by pipeline
+# stage. Index-building blocks (chunking, embedding, retrieval) trigger
+# re-indexing when changed; the rest swap without rebuilding.
+search_space:
+  chunking:
+    strategies: ["recursive", "fixed"]
+    # Numeric dimensions accept either {min, max} (continuous range) or
+    # {values: [...]} (explicit grid).
+    chunk_token_size: { values: [128, 256, 384, 512] }
+    chunk_token_overlap: { values: [0, 32, 48, 64, 128] }
+
+  embedding:
+    models:
+      - "sentence-transformers/all-MiniLM-L6-v2"
+      - "BAAI/bge-large-en-v1.5"
+      - "BAAI/bge-m3"
+      - "intfloat/e5-large-v2"
+
+  retrieval:
+    index_types:
+      - "vector_only"
+      - "hybrid_bm25_vector"
+      # - "graph_only"            # experimental, requires a graph: section below
+      # - "hybrid_graph_vector"   # experimental, requires a graph: section below
+    top_k: { min: 3, max: 20 }
+    hybrid_alpha: { min: 0.0, max: 1.0 }
+    # Fusion strategy for hybrid_bm25_vector. ``alpha`` uses hybrid_alpha;
+    # ``rrf`` is reciprocal rank fusion (parameter-free).
+    bm25_vector_fusion: ["alpha"]
+    long_context_reorder: [false]
+
+  # ``strategies`` gates whether the stage runs; ``models`` is the LLM
+  # pool drawn from when a non-"none" strategy is chosen. Leave ``models``
+  # empty (or omit) when strategies is just ["none"].
+  query_expansion:
+    strategies: ["none"]
+    models: []
+
+  reranker:
+    models:
+      - "none"
+      - "BAAI/bge-reranker-v2-m3"
+      - "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    top_n: { min: 3, max: 10 }
+
+  passage_compressor:
+    strategies: ["none"]
+    models: []
+
+  # Generator stage. ``reasoning`` allows the optimizer to toggle
+  # reasoning_effort for models that support it; set to false to pin
+  # reasoning off for every trial.
+  generator:
+    models:
+      - "gemini/gemini-3-flash-preview"
+      - "azure/gpt-4o-mini"
+      - "azure/gpt-4o"
+      - "azure/o4-mini"
+      - "bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0"
+      - "bedrock/global.anthropic.claude-sonnet-4-5-20250929-v1:0"
+      - "bedrock/global.amazon.nova-2-lite-v1:0"
+      - "openai/gpt-4o-mini"
+    reasoning: true
+    reasoning_effort: "medium"
+
+  # Shared across every LLM call (generator, compressor, expander) —
+  # the engine applies the same temperature regardless of stage.
+  temperature: { min: 1.0, max: 1.0 }
+
+  # Graph retrieval (experimental). Only active when ``retrieval.index_types``
+  # includes a graph type. Uncomment alongside the matching graph: section below.
+  # graph_retrieval:
+  #   graph_query_modes: ["local", "global", "hybrid"]
+  #   graph_top_k: { min: 20, max: 100 }
+
+
+# ── graph ──────────────────────────────────────────────────────────────────
+# Experimental. Fixed knowledge-graph build configuration. Required when
+# ``search_space.retrieval.index_types`` includes ``graph_only`` or
+# ``hybrid_graph_vector``; omit otherwise. The graph is built once before
+# optimization; mismatches between persisted build config and current
+# config are rejected (delete ./experiments/<project>/lightrag/ to rebuild).
+#
+# graph:
+#   extraction_model: "gemini/gemini-2.5-flash-lite"
+#   embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
+#   chunk_token_size: null
+#   chunk_overlap_token_size: null
+#   entity_types: null
+#   max_parallel_insert: 2
+#   llm_model_max_async: 4
+#   embedding_func_max_async: 8
+#   llm_model_max_retries: 3
+#   default_llm_timeout: 180
+#   default_embedding_timeout: 30
+#   extraction_call_timeout_s: 45.0
+#   extraction_retry_backoff_base_s: 5.0
+#   extraction_retry_backoff_max_s: 30.0
+#   build_batch_size: 20
+#   embedding_batch_size: 64
+
+
+# ── vllm ───────────────────────────────────────────────────────────────────
+# Optional vLLM server settings; only consulted when ``hosted_vllm/...``
+# models appear in the search space. The vLLM subprocess is auto-managed:
+# started before the build and swapped between models as trials require.
+#
+# vllm:
+#   max_model_len: null            # null = vLLM auto-detects from model
+#   gpu_memory_utilization: 0.90
+#   enforce_eager: true            # faster swap (~30s vs ~80s)
+#   port: 8000
+#   startup_timeout: 180
+#   extra_args: []                 # e.g. ["--reasoning-parser", "qwen3"]
+#   binary: "vllm"

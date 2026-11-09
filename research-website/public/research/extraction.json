@@ -1,0 +1,801 @@
+{
+  "source": "2610.08452v1.pdf",
+  "sha256": "c20667fa92cd393880e238e526fb14107aeedbdcc5b0a6f675fac77d4442abd8",
+  "pages": [
+    {
+      "page": 1,
+      "text": "                   Agentic AutoRAG: RAG Pipeline Optimization\n                        through Reasoning-Driven Agents\n\n\n\n                   Lasse B. Strand*, Robert Jakob, Kevin O’Sullivan, Markus Kreft\n                                ETH Zurich\n\n\n\n\n\n                        Abstract                    models (LLMs) in knowledge beyond their training\n                                                             data (Lewis et al., 2020; Gao et al., 2023). Con-\n              Retrieval-augmented generation (RAG) is a\n                                                                figuring a RAG pipeline means choosing across\n              widely used approach for grounding large lan-\n                                              many interacting dimensions: chunking, embed-             guage models (LLMs) in external knowledge.\n                                                         ding model, index type, retrieval depth, reranker,2026         However, configuring a pipeline is an expen-\n                 sive hyperparameter optimization problem over       query expansion, passage compression, and gen-\n           many interacting choices, from chunking and        erator. These choices are coupled and should notOct         embedding model to reranking and generation.      be tuned in isolation (Wang et al., 2024). The best\n               Existing optimizers, from greedy search to         retrieval depth, for instance, depends on chunk size:6\n              Bayesian optimization, reduce each trial to an                                                          small chunks each hold less text, so they need a\n               aggregate score and search without modeling\n                                                           deeper retrieval to surface the same evidence that a\n           why a configuration performed as it did, even\n                                                      few large chunks already contain. The best configu-              though the retrieved chunks already provide ev-\n               idence about whether each failure occurred dur-        ration also shifts from corpus to corpus: a pipeline[cs.CL]          ing retrieval or after it. We introduce Agentic       tuned for one can underperform on another, so the\n            AutoRAG, an LLM-agent optimizer for multi-       search must be repeated for each new one (Kartal\n                objective RAG hyperparameter optimization         et al., 2025; Orbach et al., 2026). Scoring a config-\n              with retrieval-versus-generation failure attribu-                                                               uration means running the whole pipeline over a\n                 tion.  It proposes configurations scored on a\n                                                                          test set, so the search must be sample-efficient.\n               frozen exam from the corpus: after each trial a\n                                                         Recent work applies general-purpose search al-              Diagnoser attributes each failed question to re-\n                  trieval or generation, and a Proposer, grounded       gorithms to this problem: AutoRAG’s greedy node-\n                 in a knowledge base of model rankings and pric-      wise selection (Kim et al., 2024), multi-armed ban-\n                ing, selects the next configuration, weighing         dits (Fu et al., 2024), Bayesian optimization (Con-\n              accuracy against cost to trace a Pareto frontier.     way et al., 2025; Barker et al., 2025), and genetic\n          On three multi-hop QA benchmarks it reaches       search (Kartal et al., 2025). All of these optimizers\n               higher LLM-judge accuracy than every base-                                                          reduce each trial to an aggregate score and search\n                 line we compare, and within its first 10 trials it\n                                                              the space without modeling why a configuration\n             matches or beats the statistical baselines’ full\n                                                       performed as it did. When a configuration scoresarXiv:2610.08452v1            30-trial judge accuracy. In its cost-aware mode\n             on a real-world healthcare corpus it reaches       low, they cannot tell whether retrieval and rerank-\n              a median exam accuracy of 77%, above the       ing failed to surface the relevant passages, or the\n                strongest baseline’s 71.5%, at about 58% of       generator answered incorrectly despite having the\n                 that baseline’s cost per query, and it matches        right context. However, any RAG pipeline already\n                 that 71.5% at about 22% of the cost.1                                                            records which chunks it retrieved. By checking\n                                                       whether the passages that contain the answer (the\n        1  Introduction\n                                                         gold spans) appear among them, we can attribute\n          Retrieval-augmented generation (RAG) has be-   each failure to retrieval or generation. We are not\n        come a standard way to ground large language   aware of prior RAG optimizers that use this per-\n                                                            question failure evidence to drive their configura-               *Corresponding author: lstrand.research@gmail.com\n               Accepted at the Second Workshop for REsearch on Agent    tion proposals.\n           Language Models (REALM) at EMNLP 2026 and at the Ma-    We introduce Agentic AutoRAG, a reasoning-\n            chine Learning for Systems Workshop at NeurIPS 2026.\n                                                            driven optimizer for RAG pipelines. Like recent              1Code: https://github.com/Agentic-Systems-Lab/\n          Agentic-AutoRAG                              LLM-agent optimizers for general hyperparameter\n\n\n                                                  1"
+    },
+    {
+      "page": 2,
+      "text": "tuning (Liu et al., 2025; Trirat et al., 2025), it uses    the best module at each node in pipeline order.\na language model to propose configurations, but   AutoRAG-HP (Fu et al., 2024) casts RAG tuning\nspecializes this approach to RAG and cost-aware    as a multi-armed bandit problem and tunes three\nsearch. It contributes three ideas:                   hyperparameters with a hierarchical UCB1 variant.\n                                                           syftr (Conway et al., 2025) applies multi-objective\n  1. A diagnose-then-propose loop. After each                                               Bayesian optimization (MO-TPE) to a large space\n      trial, a Diagnoser reads the per-question fail-                                                    of RAG pipelines, from standard to agentic, with a\n     ure evidence, attributes each failure to re-                                                  Pareto-Pruner that halts candidates unlikely to ex-\n      trieval or generation, and compresses it into                                                   tend the frontier and a transfer step that seeds a new\n     a short diagnosis. A Proposer then reads that                                                   search with configurations found on other datasets.\n     diagnosis and selects the next configuration.                                               Barker et al. (2025) add more objectives, tuning\n  2. A knowledge-base-grounded, cost-aware    cost, latency, safety, and alignment jointly with\n     agent. The Proposer prices and ranks can-   multi-objective Bayesian optimization. RAGSmith\n                                                    (Kartal et al., 2025) searches RAG compositions     didate configurations against public model\n     leaderboards and per-token pricing before   with a genetic algorithm. Orbach et al. (2026) com-\n    spending a trial on them, so it navigates the    pare TPE, random search, and greedy variants and\n                                                      find that about 10 trials reach the accuracy of an     accuracy-cost trade-off without first learning\n                                                  exhaustive grid, though over a space of only 162    which models are strong or cheap from trial\n                                                      configurations, far smaller than the one we search.    outcomes.\n                                                    All of these methods reduce a trial to its score\n  3. A corpus-derived exam.   Adapting  es-   and do not model why a configuration failed, which\n     tablished corpus-grounded exam generation     is the per-question evidence our optimizer diag-\n     (Guinet et al., 2024; Shashidhar et al., 2025),   noses after each trial to guide its next proposal.\n   we draft open-ended, multi-hop questions\n    with verbatim gold-answer spans, filter them    2.2 LLM agents as optimizers\n    through a sufficiency oracle, and keep only  A parallel line of work uses an LLM as the opti-\n     questions that separate configurations span-   mizer itself, though not yet applied to RAG pipeline\n    ning the search space. The exam is frozen    configuration. OPRO (Yang et al., 2024) gives the\n    once and reused as the optimization target   model a meta-prompt that lists the solutions tried\n     across every trial.                            so far with their scores and asks it to propose a\n                                                          better one, shown on tasks such as linear regression\n  We compare the optimizer against random\n                                             and prompt optimization.\nsearch and a multi-objective Bayesian optimizer\n                                                      In HPO specifically, Liu et al. (2025) introduce\n(MO-TPE). On three multi-hop QA benchmarks\n                                         AgentHPO, a two-agent framework where a Cre-\nit reaches higher LLM-judge accuracy than every\n                                                      ator proposes hyperparameters and an Executor\nbaseline we compare, and it is sample-efficient:\n                                                 runs experiments across 12 ML tasks. Trirat et al.\nwithin its first 10 trials it already matches or beats\n                                                (2025) apply LLM agents to a broader range of\nthe statistical baselines’ full 30-trial judge accuracy.\n                                     AutoML tasks.\nIn its cost-aware mode on a healthcare corpus it\n                                                These optimizers are general-purpose and single-\nreaches a median exam accuracy of 77%, above the\n                                                         objective, and they carry no prior about which mod-\nstrongest baseline’s 71.5%, at about 58% of that\n                                                            els are strong or cheap. We specialize the approach\nbaseline’s cost per query, and it matches that 71.5%\n                                                        to RAG pipeline configuration, and we ground the\nat about 22% of the cost.\n                                                 agent in a knowledge base of public model rank-\n2  Related Work                                 ings and per-token pricing so it can weigh accuracy\n                                                      against cost and rule out configurations before run-\n2.1 RAG pipeline optimization                                                 ning them.\nA RAG pipeline exposes many discrete choices,   A separate line of work builds agentic RAG sys-\nmaking its configuration a hyperparameter opti-   tems, where an agent decides what to retrieve while\nmization (HPO) problem with an expensive black-   answering each question (Asai et al., 2024; Yu et al.,\nbox objective.                                  2024; Wu et al., 2025; Leng et al., 2025; Singh\n  AutoRAG (Kim et al., 2024) decomposes the    et al., 2025). Our agent instead tunes the pipeline\npipeline into modular nodes and greedily selects    configuration rather than answering questions it-\n\n\n                                         2"
+    },
+    {
+      "page": 3,
+      "text": "   User Provided\n                                    Exam Generation\n\n\n      Corpus\n                                                                    Validate\n                               Build        Composer                       Probe-based            Frozen                                                                                      (filters +\n                          neighborhoods       Agent                          discrimination          exam\n       Search                                                         oracle)\n        space\n\n\n\n\n\n                                               Optimization Loop\n\n\n                                                                                 Recommended                             Proposer\n                                               Evaluate                                                  config +                            Agent                         Diagnoser        Proposer\n                             RAG config                                            Pareto frontier                               suggests                        Agent          Agent\n  Knowledge Base             initial config      on exam                                   + Reasoning\n   (model specs &                                                                                                 trace\n benchmark scores)                                                        Until max trials reached\n\nFigure 1: Architecture of Agentic AutoRAG. The exam generation pipeline builds a frozen exam from the corpus\nonce before optimization: TF-IDF neighborhoods seed the Composer, which drafts open-ended questions with\nverbatim gold spans, validation filters and a sufficiency oracle enforce answerability and multi-hop dependence, and\nprobe-based discrimination admits only questions that differentiate across the search space. The optimization loop\nalternates between a Diagnoser, which compresses each trial’s per-question failure evidence, and a Proposer, which\nselects the next configuration grounded in a knowledge base of public model rankings and pricing. The optimizer\noutputs a Pareto frontier over accuracy and cost, a recommended configuration, and a per-trial reasoning trace.\n\n\nself.                                          an overview.\n\n2.3  Automated RAG evaluation                  3.1  Problem Formulation\nBuilding an evaluation set from the target corpus is  A RAG pipeline Pc maps a question q to an an-\nan established way to assess retrieval-augmented   swer a under a configuration c drawn from a user-\nsystems without hand annotation (Guinet et al.,   defined search space S. The space is a product\n2024; Saad-Falcon et al., 2024; Shashidhar et al.,   of discrete and continuous dimensions covering\n2025; Filice et al., 2025). Closest to us, Guinet et al.   chunking, embedding, index type, retrieval, rerank-\n(2024) prompt an LLM to write corpus-grounded    ing, query expansion, passage compression, and\nmultiple-choice questions and use item response    generation.\ntheory to discard questions that do not separate sys-    We optimize two objectives: answer accuracy\ntems. Our exam adapts this recipe for configuration   f(c) ∈[0, 1], the fraction of exam questions an-\nsearch: the questions are open-ended with verbatim   swered correctly, and mean API cost per query\ngold spans, and we keep only those that separate    g(c), in USD. A configuration c∗Pareto-dominates\nconfigurations spanning our search space.          c when f(c∗) ≥f(c) and g(c∗) ≤g(c) with at\n                                                          least one strict inequality. The optimizer runs in\n3  Method                                            one of two modes. In its default cost-aware mode\nAgentic AutoRAG is a reasoning-driven optimizer     it optimizes both objectives and returns the non-\nfor RAG pipelines. Each trial runs a candidate   dominated set of configurations found across trials.\nconfiguration on a frozen exam of question-answer    In score-only mode it optimizes accuracy alone and\npairs, and a two-stage reasoning loop interprets the    hides the cost and Pareto signals from the agents.\nresult. A Diagnoser interprets per-question failure\n                                                    3.2  Exam Generationevidence from the trial that just ran, and a Proposer\nselects the next configuration based on the diagno-   Our framework builds an open-ended exam of\nsis. The optimizer searches over answer accuracy   question-answer pairs from the target corpus once\nand cost per query and produces a Pareto frontier    before optimization and reuses it across every trial,\nof non-dominated configurations. Figure 1 gives    so scores stay comparable from trial to trial. Exam\n\n\n                                         3"
+    },
+    {
+      "page": 4,
+      "text": "generation is an optional component: a user can    retrieved top-k), and we evaluate every candidate\nsupply a question-answer set directly, in which case   on all four. We discard the questions that every\nthe system skips generation and scores each trial on   probe answers, since they no longer separate one\nthe supplied exam. When it does generate the exam,    configuration from another, favor the questions that\nan LLM agent we call the Composer drafts the   only one or a few probes solve, and keep a small\nquestions in three stages: it reads neighborhoods of    share that no probe solves, since a configuration\nrelated chunks and drafts questions from them, val-   beyond the probe envelope may still answer them.\nidation filters the drafts, and probe-based selection   This weighting governs which questions enter the\nkeeps the questions that separate one configuration   exam, not how answers are later scored.\nfrom another. The Composer over-generates by a\n                                                    3.3  Optimization Loopconfigurable factor, so the candidate pool is larger\nthan the target exam, and validation and selection   On each trial the system builds or loads a cached in-\nthen reduce it to the requested number of questions.   dex for the proposed configuration, runs the RAG\n                                                     pipeline on every exam question, scores the an-\nNeighborhoods.  For each generation call the                                                   swers, and records which gold spans appear in the\nComposer reads a neighborhood of related chunks                                                      retrieved chunks. Recording the retrieved spans\nand drafts as many questions as  it judges the                                                                is what lets the loop attribute a failure to retrieval,\nmaterial supports, tagging each with a question                                        when the gold spans were missed, or to generation,\ntype from a fixed taxonomy of seven types (Ap-                                       when they were retrieved but the answer was still\npendix A.1, with an example of each in A.2). A                                               wrong. The trial’s outcome passes to two reasoning\nneighborhood pairs an anchor chunk with its same-                                                      agents, a Diagnoser and a Proposer.\ndocument siblings and a set of cross-document\nchunks. The cross-document chunks are ranked    Diagnoser.  The Diagnoser compresses the trial’s\nby TF-IDF cosine similarity to the anchor, a lexical    per-question evidence into a compact diagnosis,\nscore that favors chunks sharing rare, distinctive   which keeps the Proposer’s context window fo-\nterms with the anchor rather than common words.    cused on what matters.  It reads a pre-computed\n                                         summary of the trial that just ran: overall accuracy\nValidation.  Each candidate passes a set of de-   and accuracy on the questions where retrieval suc-\nterministic filters: a structural check that rejects    ceeded, how the failures divide between retrieval\na question citing one span twice rather than two   and generation, and a sample of failed questions\ndistinct ones, a self-containment filter that rejects   chosen to span different failure types and question\nquestions referring to their source by name (“the    types, including questions this configuration newly\ndocument”, “the paper”, “Chunk 1”), a non-empty-   got wrong, rather than only the lowest-scoring ones.\nspan check, and an arithmetic verification for nu-    It also sees a compact record of how accuracy\nmeric questions. Multi-hop questions then pass   moved across earlier trials, but not their config-\na sufficiency oracle. When shown all gold spans    urations, their cost, the Pareto frontier, or its own\nat once, the oracle must return the smallest sub-    earlier diagnoses. Withholding these keeps each\nset of spans that supports the answer, a verbatim    diagnosis grounded in the current trial and leaves\nquote from each, and the answer itself. A ques-   synthesis across trials to the Proposer. The Diag-\ntion is rejected when that subset is smaller than    noser emits a short narrative, findings tied to the\nits hop count, since it would then decompose into     trial’s numbers, notable changes from earlier trials,\nfewer hops. Testing the spans one at a time would   and a handful of illustrative questions for the Pro-\nmisjudge sufficiency, because a single span shown    poser. It does not prescribe configuration changes.\nalongside the question often lets the oracle infer\n                                                 Proposer.  The Proposer chooses the next config-the answer from the question itself and rate that\n                                                        uration. It reads the diagnosis, the current configu-span sufficient on its own.\n                                                         ration, the search space with its legal ranges, and\nProbe-based selection. A question is useful to   a knowledge base of model rankings and pricing.\nthe optimizer only when some of the configurations  A short plan, carried forward from one trial to the\nit will evaluate solve the question and others do not.   next, serves as the loop’s memory. Every config-\nWe measure this with four probe configurations that    uration evaluated so far stays in view, so it never\nspan the search-space extremes along several axes    repeats one. It also knows which generators, em-\n(LLM, embedding model, reranker, chunk size, and   bedding models, and rerankers remain untried, and\n\n\n                                         4"
+    },
+    {
+      "page": 5,
+      "text": "how much of the trial budget is left. In cost-aware        Corpus           Docs.   Words   Words/doc.\nmode it reads the current accuracy-cost frontier       HotpotQA        19,276   1.81M          94\ndirectly, with each non-dominated member’s accu-       MuSiQue        17,629   1.32M          75\n                                                      MultiHop-RAG     609   1.07M        1,760racy, cost, and configuration, and decides where\nalong the cost axis to probe next. It emits the next       UniDoc            250   1.30M        5,214\nconfiguration together with a rationale.\n                                                            Table 1: Corpus size for each benchmark.\n  The knowledge base lets the Proposer rule out\nconfigurations that public benchmarks predict will\nunderperform before a trial is spent on them. This                                          hop questions into one, so many items need a\nis what makes the loop tractable in a large search                                                   longer reasoning chain. MultiHop-RAG (Tang and\nspace, where naive enumeration is infeasible and                                                Yang, 2024) draws comparison, inference, and tem-\nBayesian baselines spend trials rediscovering the                                                    poral questions from a news corpus and includes\nsame priors. More importantly, it is what enables                                               unanswerable questions whose correct response is\ncost-aware search, as its per-token pricing lets the                                                       to abstain. The Pareto experiment uses the health-\nProposer weigh accuracy against cost before each                                                   care subset of UniDoc-Bench (Peng et al., 2025),\ntrial and move straight to cheap-but-capable gen-                                          230 PDFs and 20 page images that are mostly\nerators. Appendix C details its sources and the                                                biomedical research articles and medical studies.\nper-model annotations the Proposer reasons over.                                            These documents are multi-page, with tables, fig-\n  The optimizer runs for a user-specified number                                                       ures, and mixed layouts, and we parse them with\nof trials. In cost-aware mode it returns the Pareto                                              Docling (Auer et al., 2024) using table-structure\nfrontier together with an agent-recommended con-                                                     extraction and OCR. We use the documents as a\nfiguration from it, and in score-only mode the sin-                                                     corpus, generate the exam from them with our own\ngle best-scoring configuration. Either way it also                                                       pipeline, and do not use UniDoc-Bench’s labeled\nreturns the per-trial reasoning trace.                                                  question-answer pairs. Table 1 reports corpus sizes.\n\n4  Experimental Setup                                             Search space.  All methods search the same space\n                                                   of pipeline configurations.  It spans 2 chunkingWe evaluate Agentic AutoRAG in two experi-\n                                                        strategies over 4 chunk sizes and 4 overlaps, 13ments. The first, the Accuracy experiment, maxi-\n                                           embedding models, 2 index types with continu-mizes answer accuracy on three multi-hop question-\n                                              ous retrieval depth and fusion weight, 4 query-answering benchmarks and compares our optimizer\n                                                expansion strategies, 5 reranker choices with con-against random search, MO-TPE with and without\n                                                    tinuous rerank depth, and 35 generator LLMs witha warm start, and a knowledge-and-diagnosis abla-\n                                                  a per-trial reasoning toggle. Appendix B lists everytion of our own agent. To compare the optimizer in-\n                                               dimension with its range.dependently of the exam-generation component of\nour framework, this experiment optimizes against\n                                                Optimizers.  Every method sees the same search\na fixed exam built from each benchmark’s own\n                                                space and is scored on the same fixed exam at\nlabeled questions rather than the corpus-derived\n                                               each trial. Random search samples configurations\nexam of Section 3.2. The second, the Pareto exper-\n                                                uniformly and resamples when a draw violates\niment, turns on the optimizer’s cost-aware mode\n                                                a dependency constraint. MO-TPE is the multi-\nand runs the full pipeline end to end, generating an\n                                                     objective Tree-structured Parzen Estimator from\nexam from a corpus of real-world healthcare doc-\n                                             Optuna (Akiba et al., 2019) that recent RAG-tuning\numents and then tracing the accuracy-cost Pareto\n                                         work converges on (Conway et al., 2025; Orbach\nfrontier it finds. Every method runs under a fixed\n                                                             et al., 2026). We follow syftr (Conway et al., 2025)\nbudget of 30 trials, and we repeat each search ten\n                                                      in using it as the search engine and replicate it in\ntimes with independent seeds.\n                                                our own harness with a multivariate TPE sampler.\nDatasets.  The Accuracy experiment uses three    In the Accuracy experiment it optimizes answer\nmulti-hop question-answering benchmarks. Hot-   accuracy alone, and in the Pareto experiment it\npotQA (Yang et al., 2018) in the distractor set-   optimizes accuracy and cost jointly. We do not\nting asks questions that bridge or compare two   run the full syftr system: we restrict its space to\nWikipedia paragraphs.   MuSiQue-Answerable   dense and hybrid pipelines, leaving out the agentic-\n(Trivedi et al., 2022) composes two to four single-  RAG variants it also searches, disable its Pareto-\n\n\n                                         5"
+    },
+    {
+      "page": 6,
+      "text": "Figure 2: Best-so-far validation-exam accuracy over the 30-trial search, one panel per dataset. Each line is a\nmethod’s running-best accuracy averaged over the 10 search seeds, and the shaded band spans ±1 standard deviation\nacross seeds. KB Greedy, the no-search reference, is the dashed horizontal line.\n\n\nfrontier pruning, and run 30 trials per search rather   and every seed, and the seeds vary only the opti-\nthan the several hundred syftr uses. Reduced to    mizer’s own randomness, not the questions. Be-\nits search engine, MO-TPE differs from our agent    cause each seed still returns its own configuration,\nonly in how it chooses each configuration, so the    this gives ten held-out evaluations per method, and\ncomparison isolates the search strategy. MO-TPE   we report the mean and standard deviation across\n(warm) additionally seeds the study with the 30   them. For the agentic optimizer we also take its\ncompleted trials of the paired random-search run    best configuration within the first 10 and 20 trials\non the same corpus as a free, uncounted prior, so    as two additional returned configurations, reported\nit draws on information from 60 evaluations while    as Agentic@10 and Agentic@20. The validation\nevery other method sees 30. We report it at the   exam and the held-out set are different questions,\nsame 30 counted trials as a strong reference.2 We   so per-trial validation scores and held-out scores\nalso run an ablation of our own agent, Agentic (no    are not directly comparable. On the held-out set we\nKB/diag), that removes both the knowledge base    report exact match, token-level F1, and LLM-judge\nand the per-question diagnosis and leaves an LLM    accuracy against the gold answers. We also report\noptimizer that sees only the score trajectory and   each method’s search cost and embedding compute\nits own past configurations. The gap between it    in Appendix D. In the Pareto experiment we report\nand the full agent therefore measures what the di-   the Pareto frontier over answer accuracy and mean\nagnosis loop and knowledge base add on top of the    per-query API cost, scored on the corpus-derived\nlanguage model. As a non-search reference, KB   exam, which is generated once before any search\nGreedy takes each dimension’s top-rated option di-   and identical for every method and every seed. For\nrectly from the knowledge base without running   each query we sum the price of its generation and\nany trial. Our optimizer runs in score-only mode in   query-expansion calls from LiteLLM’s model cat-\nthe Accuracy experiment and in cost-aware mode    alog and average over queries. Embedding and\nin the Pareto experiment.                            reranking models run locally at no API cost, so this\n                                                      axis is the generator-side cost, which also depends\nEvaluation and metrics.  In the Accuracy exper-                                            on retrieval because the retrieved passages become\niment, every method is scored at each trial on a                                                     the generator’s input tokens.\nfixed 100-question validation exam built from the\nbenchmark’s labeled questions, and each returned   5  Results\nconfiguration is then re-evaluated on a separate\n                                                    5.1  Accuracy experiment300-question held-out gold test set that is disjoint\nfrom the search questions and unseen during search.   Best-so-far accuracy.  On all three datasets (Fig-\nBoth question sets are identical for every method    ure 2) the agentic optimizer’s best-so-far accuracy\n                                                climbs fastest, reaching most of its final accuracy\n   2This is a same-corpus warm start.  It is not the cross-\n                                                  within the first few trials and staying at the top ofdataset transfer seeding of syftr, which starts a new search\nfrom Pareto-optimal flows found on different datasets.        every panel through the rest of the budget. Ran-\n\n\n                                         6"
+    },
+    {
+      "page": 7,
+      "text": "                           HotpotQA                 MuSiQue                MultiHop-RAG\n\n Method          EM      F1      Judge    EM      F1      Judge    EM      F1      Judge\n\n Random             .506±.038 .664±.041 .774±.046 .165±.029 .215±.035 .270±.036 .633±.065 .651±.063 .706±.048\n MO-TPE            .515±.057 .673±.056 .784±.056 .193±.024 .254±.032 .301±.032 .664±.045 .677±.042 .724±.028\n MO-TPE (warm)     .521±.044 .677±.055 .786±.057 .183±.030 .243±.032 .301±.039 .666±.051 .682±.047 .731±.045\n Agentic (no KB/diag) .550±.020 .711±.024 .819±.025 .180±.022 .230±.028 .298±.024 .729±.037 .748±.035 .780±.021\n Agentic@10         .558±.015 .715±.017 .817±.014 .177±.023 .231±.028 .303±.030 .679±.056 .697±.055 .773±.021\n Agentic@20         .568±.012 .727±.009 .835±.013 .198±.027 .261±.028 .326±.030 .704±.060 .723±.061 .783±.026\n Agentic (Ours)       .566±.015 .723±.014 .825±.015 .196±.031 .262±.028 .330±.025 .729±.054 .748±.055 .790±.029\n\n KB Greedy          .480±.016 .611±.016 .702±.019 .150±.008 .187±.008 .254±.014 .507±.011 .518±.011 .544±.014\n\nTable 2: Held-out accuracy on each benchmark’s gold test slice, a 300-question stratified sample disjoint from the\nvalidation exam and unseen during search. Exact match, token-level F1, and LLM-judge accuracy are reported as\nmean±SD over the 10 search seeds. Rows above the rule are search methods run under a 30-trial budget. Agentic@10\nand @20 are the agentic optimizer’s best configuration within its first 10 and 20 trials. KB Greedy, below the rule,\nis a no-search reference that takes each dimension’s top option from the knowledge base. Best value per column\namong the search methods is in bold, with ties bold on both rows.\n\n\ndom search and cold MO-TPE climb more slowly\nand settle lower, and warm-started MO-TPE sits\nbetween them and the agent. The no-KB/diag ab-\nlation tracks closest to the full agent, so most of\nthis early efficiency comes from using a language\nmodel to propose configurations. The added lift\nfrom the knowledge base and per-question diagno-\nsis is small in the trace and shows up more clearly\nin the held-out numbers.\n\nHeld-out accuracy.  On the held-out gold test\nset (Table 2) the agentic optimizer achieves higher\nLLM-judge accuracy than every baseline across all\nthree benchmarks, at 0.825 on HotpotQA, 0.330    Figure 3: Cost-quality results on the UniDoc health-\non MuSiQue, and 0.790 on MultiHop-RAG, above    care corpus, aggregated over 10 seeds. Mean API cost\nrandom search and with the two MO-TPE vari-    per query on a log scale against accuracy on the self-\nants in between. Exact match and F1 tell the same    generated exam, with each method drawn as the point-\n                                                   wise median across seeds of its cost-accuracy attain-story on HotpotQA and MuSiQue, where an agen-\n                                                ment (line) and the interquartile (25th to 75th percentile)\ntic run holds the top score in every column. On\n                                                       spread across seeds (band). We compare our cost-aware\nMultiHop-RAG the no-KB/diag ablation matches                                                      optimizer (Agentic) against random search, cold MO-\nthe full agent’s exact match and F1 (0.729 and                                               TPE, and warm-started MO-TPE.\n0.748) and trails it only slightly on the judge, so\nthe knowledge base and per-question diagnosis add\nlittle there over a plain LLM optimizer. Accuracy  77% exam accuracy at $0.000741 per query. The\nis low for every method on MuSiQue, whose up-   strongest baseline, warm-started MO-TPE, peaks\nto-four-hop questions need multi-step retrieval that    at 71.5% and pays $0.001284, so the agent’s best\nconditions each hop on the previous hop’s results,   point is more accurate at 57.7% of the cost.  It\na pipeline shape our single-round search space   matches that 71.5% at $0.000288, 22.4% of what\ndoes not support. The low ceiling there reflects    the baseline pays.  It leads every baseline above\nthe search space rather than the optimizer, and our   $0.000236 per query. Warm MO-TPE leads only\nagent still ranks best on MuSiQue.                   in a band from $0.000097 to $0.000236, where\n                                                      neither curve reaches 60% accuracy.\n5.2  Pareto experiment                                               These median-curve gaps could still come from\nFigure 3  traces each method’s median  cost-   a few lucky seeds, so we test each claim across\naccuracy curve across the 10 seeds on the health-    all 10 seeds, using two-sided Mann-Whitney U\ncare corpus. The agent’s median curve reaches    tests (Mann and Whitney, 1947) on per-seed quan-\n\n\n                                         7"
+    },
+    {
+      "page": 8,
+      "text": "tities, Holm-corrected per family of three baseline    costs less per query than the baselines’ own best.\ncomparisons (Holm, 1979). The higher ceiling     It manages this by pricing and ranking candidates\nholds: the agent’s per-seed peak exam accuracies    against its knowledge base before running them, so\nspan 74% to 82% and rank systematically above      it moves directly to small but capable generators in-\neach baseline’s (Holm-corrected p = 0.017 against    stead of spending trials to learn which cheap model\nwarm MO-TPE, 0.025 against cold MO-TPE, and    suffices. Instead of a single configuration it returns\n0.001 against random search). The low-cost match    the whole accuracy-cost trade-off and leaves the\nholds as well: all ten agent seeds reach warm MO-   operating point to the user.\nTPE’s median peak of 71.5% within their 30 trials,\nagainst five of ten warm MO-TPE seeds, four of   7  Conclusion\nten cold MO-TPE seeds, and two of ten random-\n                                We introduce Agentic AutoRAG, a reasoning-search seeds. When seeds are ranked by the lowest\n                                                   driven optimizer for RAG pipelines.  Instead ofper-query cost at which they reach this accuracy,\n                                                  reducing each trial to an opaque score, it scores ev-with seeds that never reach it counted as the most\n                                                    ery configuration on a frozen corpus-derived exam,expensive, the agent leads every baseline (Holm-\n                                            and after each trial a Diagnoser attributes eachcorrected p ≤0.001).\n                                                        failed question to retrieval or generation while a\n                                                    Proposer, grounded in a knowledge base of public6  Discussion\n                                          model rankings and pricing, selects the next con-\nThe two experiments show the optimizer from two    figuration. On three multi-hop QA benchmarks\nangles.  In the Accuracy experiment, which iso-     it reaches higher LLM-judge accuracy than every\nlates the search from cost, the agent is sample-   baseline we compare and finds most of that accu-\nefficient: its best configuration within the first 10    racy within its first 10 trials. In its cost-aware mode\ntrials already matches or beats every statistical base-   on a healthcare corpus it reaches a median exam\nline’s full 30-trial held-out judge accuracy, at 0.817   accuracy of 77%, above the strongest baseline’s\nagainst 0.786 on HotpotQA, 0.773 against 0.731   71.5%, at about 58% of that baseline’s cost per\non MultiHop-RAG, and a tie on MuSiQue at 0.303    query, and it matches that 71.5% at about 22% of\nagainst 0.301, and the best-so-far trace (Figure 2)    the cost.\nputs it near the top of every panel within the first\nfew trials. The remaining 20 trials refine this region,   Limitations\nand the full budget is what lets the agent match the\n                                              Fixed parser.  Parsing is outside the search space.\nstronger no-KB/diag ablation on MultiHop-RAG\n                                             Every trial parses the corpus once with Docling,\nand lead on exact match and F1 on MuSiQue. The\n                                                caches the result, and tunes chunking and down-\nsample-efficiency reading holds even against warm-\n                                                 stream stages on top of it. Reparsing on every trial\nstarted MO-TPE, which begins with a free 30-trial\n                                           would dominate per-trial wall-clock time.\nsame-corpus prior and so draws on information\nfrom 60 evaluations, yet is matched or beaten by                                            Knowledge-base inputs.  The Proposer’s KB en-\nthe agent’s first 10 counted trials.                                               codes LLM rankings from Artificial Analysis and\n  The Pareto experiment is the setting we built the    per-token pricing from LiteLLM, neither of which\noptimizer for, and it is a practical deployment sce-    is peer-reviewed. The KB is also a point-in-time\nnario. Deploying a RAG pipeline is rarely a search    snapshot. Vendors re-rank, deprecate models, and\nfor the most accurate configuration at any price.   update prices over time, so the Proposer’s ground-\nA practitioner usually wants the cheapest pipeline    ing is accurate at snapshot time and degrades with\nthat clears an accuracy bar, because inference cost    the gap to the run.\nis paid on every query once the system is live. Our\ncost-aware experiment puts the agent in exactly   Agent nondeterminism.  Inference temperature\nthis position, running it end to end on the real-    is configurable, but the agent models limit repro-\nworld healthcare corpus. On this corpus the agent’s    ducibility. The Composer, Diagnoser, and Proposer\nmedian trade-off both undercuts the baselines on    default to a frontier reasoning model, several rea-\ncost and beats them on accuracy:  it matches the    soning models require a temperature of 1.0 to func-\nstrongest baseline’s median accuracy at about 22%    tion, and hosted reasoning-model APIs do not guar-\nof the cost and extends to a higher ceiling that still    antee bit-exact outputs.\n\n\n                                         8"
+    },
+    {
+      "page": 9,
+      "text": "Judge dependence.  Accuracy in both experi-   Christoph Auer, Maksym Lysak, Ahmed  Nassar,\nments is scored by an LLM judge, and we run      Michele Dolfi, Nikolaos Livathinos, Panos Vage-\n                                                                nas, Cesar Berrospi Ramis, Matteo Omenetti, Fabianno human-agreement study, so any systematic bias\n                                                          Lindlbauer, Kasper Dinkla, Lokesh Mishra, Yusik\nin the judge carries into the numbers we report.        Kim, Shubham Gupta, Rafael Teixeira de Lima,\n                                                        Valery Weber, Lucas Morin, Ingmar Meijer, Viktor\nFuture Work                                        Kuropiatnyk, and Peter W. J. Staar. 2024. Docling\n                                                              technical report. arXiv preprint arXiv:2408.09869.\nRicher cross-document  bridges.  Our exam\n                                              Matthew Barker, Andrew Bell, Evan Thomas, James\npipeline ranks bridges by lexical TF-IDF similarity,                                                             Carr, Thomas Andrews, and Umang Bhatt. 2025.\nwhich connects only chunks that share rare surface        Faster, cheaper, better: Multi-objective hyperparame-\nterms. An entity-relation graph over the corpus,        ter optimization for LLM and RAG systems. In ICLR\nas in graph-based RAG (Edge et al., 2024), would      2025 Workshop on Foundation Models in the Wild.\nalso surface bridges that share an entity but not its                                                    Alexander Conway, Debadeepta Dey, Stefan Hackmann,\nwording.                                         Matthew Hausknecht, Michael Douglas Schmidt,\n                                             Mark Lewis Steadman, and Nick Volynets. 2025.\nExpanding the search space.  The diagnose-       syftr: Pareto-optimal generative AI. In Proceedings\nthen-propose loop is agnostic to what the search       of the Fourth International Conference on Automated\n                                                 Machine Learning, volume 293 of Proceedings of\nspace contains, so it can tune richer pipeline fam-                                                  Machine Learning Research, pages 6/1–33. PMLR.\nilies than the modular flow we search here. Sup-\nporting whole architectures, such as agentic RAG    Darren Edge, Ha Trinh, Newman Cheng, Joshua\n                                                          Bradley, Alex Chao, Apurva Mody, Steven Truitt,or graph-based RAG, would let it search across\n                                                 Dasha Metropolitansky, Robert Osazuwa Ness, and\nretrieval paradigms rather than within one.                                                       Jonathan Larson. 2024. From local to global: A\n                                                     graph RAG approach to query-focused summariza-\nMore objectives.  The optimizer weighs only ac-       tion. arXiv preprint arXiv:2404.16130.\ncuracy and cost today, and its knowledge base al-\n                                                Kenneth Enevoldsen, Isaac Chung, Imene Kerboua,ready records throughput and memory, so latency\n                                                 Márton  Kardos,  Ashwin  Mathur,  David  Stap,\nor memory footprint are natural additions.                                                       Jay Gala, Wissam Siblini, Dominik Krzemi´nski,\n                                                     Genta Indra Winata, Saba Sturua, Saiteja Utpala, et al.\nWarm starts across runs.  Each run begins cold      2025. MMTEB: Massive multilingual text embed-\non a new corpus. Carrying diagnoses and config-      ding benchmark.  In International Conference on\nuration priors across runs would let it start warm,      Learning Representations (ICLR).\naccumulating an agent memory the optimizer re-                                              Simone Filice, Guy Horowitz, David Carmel, Zohar\ntrieves from to generalize what it learns about RAG      Karnin, Liane Lewin-Eytan, and Yoelle Maarek.\nconfiguration from one corpus to the next.              2025. Generating Q&A benchmarks for RAG evalua-\n                                                                 tion in enterprise settings. In Proceedings of the 63rd\n                                                    Annual Meeting of the Association for Computational\nAcknowledgments                                                             Linguistics (Volume 6: Industry Track), pages 469–\n                                                         484, Vienna, Austria. Association for Computational\nThis work was carried out at the ETH Agentic Sys-                                                               Linguistics.\ntems Lab. We thank David Schaurecker for provid-\ning API credits to support the LLM usage.             Jia Fu, Xiaoting Qin, Fangkai Yang, Lu Wang, Jue\n                                                    Zhang, Qingwei Lin, Yubo Chen, Dongmei Zhang,\n                                                       Saravan Rajmohan, and Qi Zhang. 2024. AutoRAG-\n                                               HP: Automatic online hyper-parameter tuning for\nReferences                                             retrieval-augmented generation. In Findings of the\n                                                          Association for Computational Linguistics: EMNLP\nTakuya Akiba, Shotaro Sano, Toshihiko Yanase, Takeru                                                        2024, pages 3875–3891, Miami, Florida, USA. Asso-\n   Ohta, and Masanori Koyama. 2019. Optuna: A next-                                                                ciation for Computational Linguistics.\n   generation hyperparameter optimization framework.\n   In Proceedings of the 25th ACM SIGKDD Interna-   Yunfan Gao, Yun Xiong, Xinyu Gao, Kangxiang Jia,\n   tional Conference on Knowledge Discovery & Data        Jinliu Pan, Yuxi Bi, Yi Dai, Jiawei Sun, Qianyu Guo,\n  Mining, pages 2623–2631.                      Meng Wang, and Haofen Wang. 2023.  Retrieval-\n                                                   augmented generation for large language models: A\nAkari Asai, Zeqiu Wu, Yizhong Wang, Avirup Sil, and       survey. arXiv preprint arXiv:2312.10997.\n  Hannaneh Hajishirzi. 2024. Self-RAG: Learning to\n   retrieve, generate, and critique through self-reflection.    Gauthier Guinet, Behrooz Omidvar-Tehrani, Anoop De-\n   In International Conference on Learning Representa-       oras, and Laurent Callot. 2024. Automated evalu-\n   tions.                                                     ation of retrieval-augmented language models with\n\n\n                                         9"
+    },
+    {
+      "page": 10,
+      "text": "   task-specific exam generation. In Proceedings of the   Xiangyu Peng, Can Qin, Zeyuan Chen, Ran Xu, Caim-\n   41st International Conference on Machine Learning,      ing Xiong, and Chien-Sheng Wu. 2025. UniDoc-\n  volume 235 of Proceedings of Machine Learning      Bench: A unified benchmark for document-centric\n  Research, pages 16773–16801. PMLR.                 multimodal RAG. arXiv preprint arXiv:2510.03663.\n\nSture Holm. 1979. A simple sequentially rejective mul-    Valentina  Pyatkin, Saumya Malik,  Victoria  Graf,\n   tiple test procedure. Scandinavian Journal of Statis-     Hamish Ivison, Shengyi Huang, Pradeep Dasigi,\n   tics, 6(2):65–70.                                   Nathan Lambert, and Hannaneh Hajishirzi. 2025.\n                                                         Generalizing verifiable instruction following. In Ad-\nMuhammed Yusuf Kartal, Suha Kagan Kose, Ko-      vances in Neural Information Processing Systems\n  rhan Sevinç, and Burak Aktas. 2025. RAGSmith:      (NeurIPS), Datasets and Benchmarks Track.\n A framework for finding the optimal composition\n   of retrieval-augmented generation methods across    David Rein, Betty Li Hou, Asa Cooper Stickland, Jack-\n   datasets. arXiv preprint arXiv:2511.01386.             son Petty, Richard Yuanzhe Pang, Julien Dirani, Ju-\n                                                                   lian Michael, and Samuel R. Bowman. 2024. GPQA:\nDongkyu Kim, Byoungwook Kim, Donggeon Han, and    A graduate-level google-proof q&a benchmark. In\n  Matouš Eibich. 2024. AutoRAG: Automated frame-      Conference on Language Modeling (COLM).\n  work for optimization of retrieval augmented genera-\n                                                    Jon Saad-Falcon, Omar Khattab, Christopher Potts, and   tion pipeline. arXiv preprint arXiv:2410.20878.\n                                                    Matei Zaharia. 2024. ARES: An automated evalua-\nYongqi Leng, Yikun Lei, Xikai Liu, Meizhi Zhong,       tion framework for retrieval-augmented generation\n  Bojian Xiong, Yurong Zhang, Yan Gao, Yi Wu, Yao      systems. In Proceedings of the 2024 Conference of\n  Hu, and Deyi Xiong. 2025. DecEx-RAG: Boosting       the North American Chapter of the Association for\n   agentic retrieval-augmented generation with decision      Computational Linguistics: Human Language Tech-\n  and execution optimization via process supervision.      nologies (Volume 1: Long Papers), pages 338–354,\n   In Proceedings of the 2025 Conference on Empirical      Mexico City, Mexico. Association for Computational\n  Methods in Natural Language Processing: Industry       Linguistics.\n   Track, pages 1412–1425, Suzhou, China. Association\n                                         Sumuk Shashidhar, Clémentine Fourrier, Alina Lo-   for Computational Linguistics.\n                                                       zovskaya, Thomas Wolf, Gokhan Tur, and Dilek\nPatrick Lewis, Ethan Perez, Aleksandra Piktus, Fabio      Hakkani-Tür. 2025. Yourbench: Dynamic evalua-\n   Petroni, Vladimir Karpukhin, Naman Goyal, Hein-       tion set generation with LLMs. In Conference on\n   rich Küttler, Mike Lewis, Wen-tau Yih, Tim Rock-     Language Modeling (COLM).\n   täschel, Sebastian Riedel, and Douwe Kiela. 2020.                                                        Aditi Singh, Abul Ehtesham, Saket Kumar, Tala Ta-\n  Retrieval-augmented  generation  for  knowledge-                                                                      laei Khoei, and Athanasios V. Vasilakos. 2025. Agen-\n   intensive NLP tasks. In Advances in Neural Infor-                                                                            tic retrieval-augmented generation: A survey on agen-\n  mation Processing Systems, volume 33, pages 9459–                                                                          tic RAG. arXiv preprint arXiv:2501.09136.\n  9474.\n                                                Yixuan Tang and Yi Yang. 2024.  MultiHop-RAG:\nSiyi Liu, Chen Gao, and Yong Li. 2025. AgentHPO:                                                 Benchmarking retrieval-augmented generation for\n  Large language model agent for hyper-parameter op-                                                         multi-hop queries. In Conference on Language Mod-\n   timization. In Proceedings of the Conference on Par-                                                              eling (COLM).\n  simony and Learning, volume 280 of Proceedings\n   of Machine Learning Research, pages 1146–1169.    Patara Trirat, Wonyong Jeong, and Sung Ju Hwang.\n  PMLR.                                             2025. AutoML-Agent: A multi-agent LLM frame-\n                                                 work for full-pipeline AutoML. In Proceedings of the\nHenry B. Mann and Donald R. Whitney. 1947. On     42nd International Conference on Machine Learn-\n  a test of whether one of two random variables is       ing, volume 267 of Proceedings of Machine Learning\n   stochastically larger than the other. The Annals of      Research, pages 60099–60146. PMLR.\n  Mathematical Statistics, 18(1):50–60.\n                                                  Harsh Trivedi, Niranjan Balasubramanian, Tushar Khot,\nNiklas Muennighoff, Nouamane Tazi, Loïc Magne, and      and Ashish Sabharwal. 2022.  MuSiQue:  Multi-\n   Nils Reimers. 2023. MTEB: Massive text embedding     hop questions via single-hop question composition.\n  benchmark. In Proceedings of the 17th Conference      Transactions of the Association for Computational\n   of the European Chapter of the Association for Com-       Linguistics, 10:539–554.\n   putational Linguistics, pages 2014–2037, Dubrovnik,\n   Croatia. Association for Computational Linguistics.    Xiaohua Wang, Zhenghua Wang, Xuan Gao, Feiran\n                                                    Zhang,  Yixin Wu,  Zhibo Xu,  Tianyuan  Shi,\nMatan Orbach, Ohad Eytan, Benjamin Sznajder, Ariel      Zhengyuan Wang, Shizheng Li, Qi Qian, Ruicheng\n  Gera,  Odellia Boni, Yoav Kantor,  Gal Bloch,      Yin, Changze Lv, Xiaoqing Zheng, and Xuanjing\n  Omri Levy, Hadas Abraham, Nitzan Barzilay, Eyal      Huang. 2024.   Searching for best practices in\n  Shnarch, Michael E. Factor, Shila Ofek-Koifman,      retrieval-augmented generation. In Proceedings of\n  Paula Ta-Shma, and Assaf Toledo. 2026. An anal-      the 2024 Conference on Empirical Methods in Natu-\n   ysis of hyper-parameter optimization methods for       ral Language Processing, pages 17716–17736, Mi-\n   retrieval augmented generation. In AAAI 2026 Work-      ami, Florida, USA. Association for Computational\n  shop on New Frontiers in Information Retrieval.           Linguistics.\n\n\n                                         10"
+    },
+    {
+      "page": 11,
+      "text": "Orion Weller, Benjamin Chang, Sean MacAvaney, Kyle    Definitional. A short definition or description the\n  Lo, Arman Cohan, Benjamin Van Durme, Dawn       chunk states explicitly.\n   Lawrie, and Luca Soldaini. 2025. FollowIR: Eval-\n   uating and teaching information retrieval models to                                         Numeric (single-span). Computes a value not\n   follow instructions. In Proceedings of the 2025 Con-\n                                                             stated verbatim by combining at least two nu-   ference of the Nations of the Americas Chapter of the\n  Association for Computational Linguistics: Human        meric literals inside one span (sum, difference,\n  Language Technologies (Volume 1: Long Papers),        range, median, count).\n   pages 11926–11942, Albuquerque, New Mexico. As-\n   sociation for Computational Linguistics.              Inference. Composes facts from at least two dis-\nRuofan Wu, Youngwon Lee, Fan Shu, Danmei Xu,          tinct spans into an answer that is not a contigu-\n  Seung-won Hwang, Zhewei Yao, Yuxiong He, and        ous substring (causal chain, implicit-referent\n  Feng Yan. 2025. ComposeRAG: A modular and com-         resolution, qualitative direction from quantita-\n   posable RAG for corpus-grounded multi-hop ques-\n                                                                 tive facts).   tion answering. arXiv preprint arXiv:2506.00232.\n\nChengrun Yang, Xuezhi Wang, Yifeng Lu, Hanxiao Liu,   Bridge. References an entity in one chunk via\n  Quoc V. Le, Denny Zhou, and Xinyun Chen. 2024.       an indirect descriptor that another chunk\n  Large language models as optimizers.  In Interna-\n                                                     uniquely identifies, then asks for an attribute\n   tional Conference on Learning Representations.\n                                                         of that entity.\nZhilin Yang, Peng Qi, Saizheng Zhang, Yoshua Bengio,\n  William Cohen, Ruslan Salakhutdinov, and Christo-   Comparison. Reads a comparable value from\n   pher D. Manning. 2018. HotpotQA: A dataset for                                                   each cited chunk and returns the relation\n   diverse, explainable multi-hop question answering.\n                                                   (which is larger, by how much).   In Proceedings of the 2018 Conference on Empiri-\n   cal Methods in Natural Language Processing, pages\n  2369–2380, Brussels, Belgium. Association for Com-   Numeric (multi-span). Computes  across  cited\n   putational Linguistics.                                   spans: difference, sum, ratio, duration.\n\nTian Yu,  Shaolei Zhang,  and Yang Feng. 2024.\n  Auto-RAG: Autonomous retrieval-augmented gen-     Both numeric types also carry an arithmetic for-\n   eration for large language models. arXiv preprint   mula. The Composer must supply it alongside the\n   arXiv:2411.19443.                                answer, and the validator rejects the question when\n                                                    the formula does not evaluate to the canonical an-A  Question taxonomy and exam samples\n                                                   swer. This guards against arithmetic mistakes by\nThis appendix complements the exam-generation    the Composer LLM.\npipeline in Section 3.2 by listing the seven ques-\n                                            Source spans.  Each source span is the minimaltion types the Composer draws from and showing\n                                                   excerpt the answer strictly depends on, usually aone representative item per type. The examples\n                                                     single sentence. A span carries none of the sur-come from the 100-question exam the optimizer\n                                                rounding context, so the example spans below cangenerated for the UniDoc healthcare corpus, the\n                                             be hard to read on their own. Each records onlyone experiment where the generated exam is the op-\n                                                     the exact text a pipeline must retrieve, not the con-timization target. The Accuracy experiment instead\n                                                         text that explains the answer. Retrieval counts asoptimizes against each benchmark’s own held-in\n                                                    successful for a question only when the retrievedquestions and generates no exam, so this appendix\n                                               chunks contain all of its spans, and the per-questiondocuments the pipeline where it runs.\n                                                     diagnosis uses this test to attribute a failure to weak\nA.1  Question types                                   retrieval rather than weak generation.\nThe Composer assigns one type per question from\n                                                   Distribution on UniDoc.  Table 3 reports the type\na fixed taxonomy of seven question types defined\n                                                          distribution of the 100 questions that survive valida-\na priori. The taxonomy extends the bridge and\n                                                        tion and probe-based selection on UniDoc. Extrac-\ncomparison split of HotpotQA (Yang et al., 2018)\n                                                       tion is well represented (16): the documents state\nwith numeric and inference variants common to\n                                      many specific facts buried in long, multi-section\nmulti-hop benchmarks such as MuSiQue (Trivedi\n                                                         text that are not trivially retrievable. Definitional\net al., 2022).\n                                                  questions do not survive selection, and only one\nExtraction. A factoid lookup answerable from a    single-span numeric question does, because most\n     single span.                                numeric reasoning here combines values that sit in\n\n\n                                         11"
+    },
+    {
+      "page": 12,
+      "text": "             Question type          Count                                                                              sity (OD); Haffkine: 0.89 OD) and B. sindanus (titre:\n              Extraction               16                     1:500; PSVPL: 0.89 OD; Haffkine: 0.76 OD) rela-\n               Definitional               0                         tively well, they exhibited limited to poor recogni-\n            Numeric (single-span)       1                        tion potential against the venom of B. romulusi (titre:\n              Inference                25                      1:500; PSVPL: 0.24 OD; Haffkine: 0.25 OD).”\n             Bridge                  19\n            Comparison              25                   Bridge\n            Numeric (multi-span)      14\n                                                              Question. For the treatment comparison that showed              Total                  100\n                                                              a statistically significant difference in adverse reac-\n                                                                         tions (p < 0.001), what was the male-to-female ratio\nTable 3: Question-type distribution of the 100-question         in each arm?\nUniDoc exam.                                            Answer. 59:7 (variant: “59/7”).\n                                                         Source spans.\n                                                           “Male/female ratio, Group I (Budesonide 400 mcg\ndifferent spans. The exam also stays within docu-        plus Formoterol 6 mcg) = 59/7. Male/female ratio,\n                                                      Group II (Tiotropium 18 mcg plus Formoterol 12\nments: 98 questions keep all their spans within one                                                      mcg) = 59/7.”\ndocument, and only 2 cross into a second.                                                                “In group I, following adverse drug reactions were\n                                                                  observed; sore throat, hoarseness of voice, oral ulcers,\nA.2  Example questions                                    tremors, 2 patients showed acute exacerbation and\n                                                       1 had pneumonitis. In group II, following adverse\nOne representative item per surviving type, drawn        drug reactions were observed; dryness of mouth, pal-\n                                                                          pitations, tremors and 2 patients developed urinaryverbatim from the UniDoc exam. Source spans are\n                                                                          retention. After that we have done Fisher’s exact test\nreproduced as written.                                   and we observed that there is statistically significant\n                                                                    difference (p < 0.001) between group I and group    Extraction\n                                                                                       II.”\n    Question. What fraction of European American hap-\n    lotypes in the registry are represented by only one          Comparison\n    individual?\n   Answer. 44.65% (variant: “44.65 percent”).                   Question. How did particle concentration change\n                                                    when antibodies were added without magnetic beads,   Source span. “Application of our estimator to 6.59\n                                                         compared to when uncoated beads were used?    million donors in the Be The Match Registry revealed\n     that haplotypes follow a heavy tail distribution across          Answer. Increased by 105% versus no change (vari-\n     all ethnicities: for example, 44.65% of the European              ant: “rose by 105% versus unchanged”).\n   American haplotypes are represented by only 1 indi-          Source spans.\n    vidual.”                                       “We applied an identical bead procedure, except that\n                                                we abstained from coating the beads with anti-ApoB\n   Numeric (single-span)                                          antibodies prior to the incubation with the diluted PFP\n                                                              sample. This resulted in no changes in particle con-\n    Question. What is the average CK-MB value across             centration and size distribution curve.”\n    both cattle cases with tropical theileriosis?                 “we conducted a parallel experiment with a two-hour\n   Answer. 362.5 U/L.                                            incubation of diluted PFP with 10 µg of anti-ApoB an-\n   Formula. (344 + 381)/2 = 362.5.                               tibodies that had not been attached to magnetic beads,\n                                                        which resulted in an increase in particle concentra-   Source span. “CK-MB, Table 2. Biochemical find-\n                                                                      tion by 105% as well as a notable shift of the size\n    ings of two cases.Unit = (U/L). CK-MB, Case-1 =\n                                                                         distribution curve to the right”\n    344. CK-MB, Case-2 = 381. CK-MB, Referance\n   Range* = 189-235 **.”\n                                                     Numeric (multi-span)\n\n    Inference\n                                                             Question. What is the ratio of items to care-plan do-\n    Question. Why does the commercial Indian an-           mains in the interRAI Mental Health assessment?\n    tivenom show limited efficacy against the newly dis-          Answer. 19.8 items per domain (variant: “approxi-\n    covered krait species from Southern India?                    mately 20 items per domain”).\n   Answer.   Antivenom  is manufactured from B.          Formula. 396/20 = 19.8.\n    caeruleus venom, not from the new species (variant:          Source spans.\n   “because it is made from B. caeruleus venom”).              “The interRAI Mental Health (MH) assessment (157,\n   Source spans.                                            158) supports care plan development in 20 domains,\n    “Considering the near countrywide distribution of this           and is used in in-patient mental health settings”\n    clinically important snake, B. caeruleus venoms are                                                        “The assessment is comprised of 396 items in several\n    used for the manufacture of commercial Indian poly-                                                          domains (see Table 1).”\n    valent antivenoms.”\n\n   “While both antivenoms recognised the venoms of B.\n    caeruleus (titre: 1:500; PSVPL: 1.02 Optical Den-\n\n\n\n                                         12"
+    },
+    {
+      "page": 13,
+      "text": "B  Search space                                               neighborhood_cross_doc_weight: 0.2\n\n                                                                     parsing:   # OCR + tables on for the UniDoc PDFs\nThe search space is one of the inputs the user sup-        parser: docling\nplies to the optimizer, alongside the corpus.  It         ocr: true                                                                       table_structure: true\nis a single YAML file (Listing 1) that names the\n                                                                     search_space:   # dimensions searched\ncorpus, the models that drive the optimizer, the         chunking:   # how documents are split\nexam-generation settings, and the dimensions to           strategies:chunk_token_size:[recursive,[128, fixed]256, 384, 512]\nsearch. The optimizer reads this file directly, so the           chunk_token_overlap: [0, 32, 48, 64]\nsearch space is fully specified and auditable before         embedding:   # 13 retrievers\nany trial runs.                                                        models:- IEITYuan/Yuan-embedding-2.0-en\n   Listing 1 shows the configuration for the Pareto             - Qwen/Qwen3-Embedding-0.6B                                                                           - ibm-granite/granite-embedding-english-r2\nexperiment on UniDoc, where the optimizer gen-            - ibm-granite/granite-embedding-small-english-r2\n                                                                           - intfloat/e5-large-v2\nerates and scores its own exam. The Accuracy ex-            - intfloat/multilingual-e5-large-instruct\nperiment, on HotpotQA, MuSiQue, and MultiHop-            -- BAAI/bge-large-en-v1.5BAAI/bge-small-en-v1.5\nRAG, shares the same search_space and differs             - BAAI/bge-m3\n                                                                           - Snowflake/snowflake-arctic-embed-l-v2.0\nonly in its exam source, cost mode, and parsing,            - Snowflake/snowflake-arctic-embed-xs\neach described below.  Those runs supply each             -- mixedbread-ai/mxbai-embed-large-v1sentence-transformers/all-MiniLM-L6-v2\nbenchmark’s own held-in questions as the valida-\n                                                                       retrieval:\ntion exam through examiner.custom_exam_path           index_types: [vector_only, hybrid_bm25_vector]\nand generate none, so the examiner block in the           top_k:hybrid_alpha:{ min: 3,{ min:max:0.0,20 }max:# retrieved1.0 }   # chunkslexical/dense\nlisting does not apply to them. They also run score-          bm25_vector_fusion: [alpha, rrf]                                                                         long_context_reorder: [false, true]\nonly rather than cost-aware, and they parse pre-\n                                                                       query_expansion:\nextracted text with OCR and table-structure extrac-          strategies: [none, hyde, multi_query, query_decompose]\ntion off. UniDoc, built from real PDFs and page           models: [azure/gpt-4o-mini]   # fixed expander\nimages, turns both on, sets cost_aware to true,        reranker:\n                                                                         models:\nand weights the exam-generation neighborhoods             - none\ntoward same-document siblings (0.8 / 0.2) be-            -- BAAI/bge-reranker-v2-m3cross-encoder/ms-marco-MiniLM-L-6-v2\ncause its documents are long and multi-section.                - Alibaba-NLP/gte-reranker-modernbert-base\n                                                                           - mixedbread-ai/mxbai-rerank-xsmall-v1\n                                                                         top_n: { min: 3, max: 10 }   # reranked chunks\n  # Project configuration: corpus, optimizer models, exam\n  # settings, and the search space. Provided by the user.              generator:   # 35 answer LLMs\n                                                                         models:\n  meta:                                                                    - bedrock/us.amazon.nova-micro-v1:0\n    project_name: unidoc-pareto                                            - bedrock/us.amazon.nova-lite-v1:0\n    corpus_path: ./corpus                                                  - bedrock/us.amazon.nova-pro-v1:0\n    # free-text hint read by the optimizer                                 - bedrock/google.gemma-3-4b-it\n    corpus_description: |                                                  - bedrock/google.gemma-3-12b-it\n      Real-world healthcare PDFs and scanned page images:                  - bedrock/google.gemma-3-27b-it\n      insurance forms, claims, clinical notes. Dense,                      - bedrock/us.meta.llama3-1-8b-instruct-v1:0\n      domain-specific prose with tables and mixed layouts.                 - bedrock/us.meta.llama3-3-70b-instruct-v1:0\n    max_trials: 30   # search budget                                       - bedrock/us.meta.llama4-scout-17b-instruct-v1:0\n    cost_aware: true   # Pareto run; the Accuracy experiment               - bedrock/us.meta.llama4-maverick-17b-instruct-v1:0\n        sets false                                                          - bedrock/mistral.magistral-small-2509\n                                                                           - bedrock/mistral.ministral-3-3b-instruct\n  model_aliases:   # map names to your deployments                         - bedrock/mistral.ministral-3-8b-instruct\n    azure/gpt-5-nano:   <your-deployment>                                  - bedrock/mistral.ministral-3-14b-instruct\n    azure/gpt-5-mini:   <your-deployment>                                  - bedrock/mistral.mistral-7b-instruct-v0:2\n    azure/gpt-4.1-nano: <your-deployment>                                  - bedrock/mistral.mistral-large-3-675b-instruct\n    azure/gpt-4.1-mini: <your-deployment>                                  - bedrock/mistral.mixtral-8x7b-instruct-v0:1\n                                                                           - bedrock/nvidia.nemotron-nano-3-30b\n  # LLMs that drive the optimizer and grade answers                        - bedrock/openai.gpt-oss-20b-1:0\n  agent:                                                                   - bedrock/openai.gpt-oss-120b-1:0\n    optimizer_model: kimi-k2.5      # diagnose + propose                   - bedrock/qwen.qwen3-32b-v1:0\n    examiner_model:  minimax-m2.5   # compose exam                         - bedrock/qwen.qwen3-coder-30b-a3b-v1:0\n    judge_model:     DeepSeek-V3.2  # grade answers                        - bedrock/zai.glm-4.7\n    optimizer_reasoning_effort: medium                                     - azure/gpt-4o\n    examiner_reasoning_effort: medium                                      - azure/gpt-4o-mini\n                                                                           - azure/gpt-4.1-mini\n  examiner:   # exam generation (skipped when an exam is                   - azure/gpt-4.1-nano\n        supplied)                                                           - azure/o4-mini\n    exam_size: 100                                                         - azure/gpt-5-mini\n    # seed this x exam_size neighborhoods; the composer                    - azure/gpt-5-nano\n    # over-generates questions, then filter to exam_size                   - azure/gpt-5.4-mini\n    initial_question_multiplier: 1.8                                       - azure/gpt-5.4-nano\n    probe_selection: true   # keep discriminative items                    - vertex_ai/gemini-2.5-flash\n    neighborhood_min_chunks: 18   # context per call                       - vertex_ai/gemini-2.5-flash-lite\n    neighborhood_min_words: 5000                                           - vertex_ai/gemini-3.1-flash-lite-preview\n    # neighborhood mix, favoring same-document spans                     # when true, trials may use reasoning or plain models,\n    neighborhood_same_doc_weight: 0.8\n\n\n                                         13"
+    },
+    {
+      "page": 14,
+      "text": "      # passing reasoning params to LiteLLM where supported\n      reasoning: true\n      reasoning_effort: medium   # when reasoning is on\n\n    temperature: { min: 1.0, max: 1.0 }\n\nListing  1:   Project  configuration  for  the  Pareto\nexperiment on UniDoc, the file the user supplies to the\noptimizer. The Accuracy experiment shares the same\nsearch_space but supplies its own held-in exam and\nruns score-only.\n\n\nC  Knowledge base\n\nAppendix B names the candidate models. This ap-\npendix shows the annotations the Proposer reasons\nover for each one. The knowledge base pairs every\nmodel in the search space with public benchmark\nscores, per-token pricing, and serving attributes,\nwhich lets the Proposer rank candidates and rule\nout quality-cost-dominated choices before it spends\na trial on them. LLM benchmarks and throughput\ncome from Artificial Analysis,3 embedding and\nreranker rankings from the MTEB (Muennighoff\net al., 2023), MMTEB (Enevoldsen et al., 2025),\nand FollowIR (Weller et al., 2025) benchmarks,\nand per-token pricing from LiteLLM.4 The opti-\nmizer renders the knowledge base filtered to the\nconfigured search space and to the run’s reasoning-\neffort setting, so a model that supports reasoning\ncan appear as two entries, one reasoning and one\nnon-reasoning, with different scores. The 35 gener-\nator models of Appendix B therefore render as 49\nscored entries.\n  Tables 4, 5, and 6 report the generator, embed-\nding, and reranker annotations. The embedding\nand reranker tables are complete, whereas for gen-\nerators we show twelve models spanning the intel-\nligence range. The Proposer treats these scores as\ncomparative signal, not ground truth.\n  The scores are a point-in-time snapshot, taken\nin May 2026 for the LLM benchmarks and pricing\nand from the MTEB(eng, v2) leaderboard for the\nembedders.\n\n\n\n\n\n   3https://artificialanalysis.ai/\n   4https://github.com/BerriAI/litellm\n\n\n                                         14"
+    },
+    {
+      "page": 15,
+      "text": "Model               Creator        Intel.   GPQA     IFBench      In $/M     Out $/M     Tok/s     Reasoning\n\nglm-4.7          Z AI          42.1      0.859        0.679        0.60         2.20       86        Yes\ngpt-5-mini         OpenAI       38.9      0.803        0.712        0.25         2.00      106        Yes\ngpt-5.4-mini        OpenAI       37.7      0.823        0.648        0.75         4.50      172        Yes\ngpt-oss-120b       OpenAI       33.3      0.782        0.690        0.15         0.60      289        Yes\ngemini-2.5-flash     Google       27.0      0.790        0.503        0.30         2.50      225        Yes\ngpt-5-nano         OpenAI       25.9      0.670        0.659        0.05         0.40      151        Yes\ngpt-4.1-mini        OpenAI       22.9      0.664        0.383        0.40         1.60       80      No\nmistral-large-3        Mistral       22.8      0.680        0.362        0.50         1.50       58      No\nllama4-maverick     Meta         18.4      0.671        0.430        0.24         0.97      122      No\ngpt-4o            OpenAI       17.3      0.543        0.343        2.50        10.00      172      No\nnova-micro        Amazon      10.3      0.358        0.294        0.04         0.14      318      No\ngemma-3-4b        Google         6.3      0.291        0.283        0.04         0.08        –      No\n\nTable 4: Generator-LLM annotations in the knowledge base, a twelve-model slice across the intelligence range (the\nfull set of 35 models, which render as 49 reasoning and non-reasoning entries, is named in Appendix B). Intel. is the\nArtificial Analysis intelligence index. GPQA (Rein et al., 2024) and IFBench (Pyatkin et al., 2025) are accuracies in\n[0, 1]. Prices are USD per million input and output tokens. Tok/s is median output throughput. Reasoning marks\nwhich variant the listed scores describe. Model names abbreviate the LiteLLM identifiers in Appendix B, and a\ndash marks a value unpublished in the snapshot.\n\n\n\n\n\nModel                           Dim.   Max tok.   Params (B)    Retrieval    STS    Rerank.   Mem. (MB)\n\nYuan-embedding-2.0-en             1024      2048         0.596       0.707    0.849      0.533         2272\nQwen3-Embedding-0.6B            1024     32768         0.596       0.618    0.858      0.482         1136\nsnowflake-arctic-embed-l-v2.0        1024      8192         0.568       0.586    0.770      0.475         2166\ngranite-embedding-english-r2         768      8192         0.149       0.564    0.781      0.491          284\nmxbai-embed-large-v1              1024       512         0.335       0.556    0.772      0.480          639\nbge-large-en-v1.5                  1024       512         0.335       0.554    0.759      0.483         1242\ngranite-embedding-small-english-r2    384      8192         0.048       0.539    0.766      0.476           91\nbge-small-en-v1.5                   512       512         0.033       0.539    0.739      0.469          127\nmultilingual-e5-large-instruct         1024       514         0.560       0.535    0.843      0.487         1068\nsnowflake-arctic-embed-xs            384       512         0.023       0.526    0.728      0.453           86\nbge-m3                          1024      8194         0.568       0.510    0.799         –         2167\ne5-large-v2                       1024       514         0.335       0.493    0.749      0.457         1278\nall-MiniLM-L6-v2                  384       256         0.023       0.430    0.704      0.471           87\n\nTable 5: The 13 embedding models in the search space with their MTEB(eng, v2) (Muennighoff et al., 2023)\nscores. Retrieval, STS, and reranking (Rerank.) are the corresponding MTEB task scores in [0, 1]. Dim. is the\nembedding dimension, Max tok. the maximum input length, Params (B) the parameter count in billions, and Mem.\nthe memory footprint. The Proposer ranks retrievers by the Retrieval score. Names drop the organization prefix\nlisted in Appendix B, and a dash marks a value unpublished in the snapshot.\n\n\n\n\n\nModel                              Params (B)        MTEB-R        MMTEB-R           FollowIR\n\nbge-reranker-v2-m3                              0.6               0.570                 0.584            −0.01\nms-marco-MiniLM-L-6-v2                   0.022                 –                   –                 –\ngte-reranker-modernbert-base                   –                 –                   –                 –\nmxbai-rerank-xsmall-v1                       –                 –                   –                 –\n\nTable 6: The four reranker models in the search space (a fifth option, none, disables reranking). MTEB-R and\nMMTEB-R are the MTEB (Muennighoff et al., 2023) and MMTEB (Enevoldsen et al., 2025) reranking-task scores\nin [0, 1], and FollowIR (Weller et al., 2025) is the instruction-following retrieval score. Coverage is sparse, with\npublished scores for only one of the four rerankers in the snapshot, so the Proposer has little benchmark signal here\nand relies on rerank depth and downstream accuracy. Names abbreviate the identifiers in Appendix B, and a dash\nmarks a value unpublished in the snapshot.\n\n\n\n\n                                         15"
+    },
+    {
+      "page": 16,
+      "text": "Figure 4: Search cost and embedding compute on the three datasets of the Accuracy experiment. Bars show the\nmean over the 10 search seeds and whiskers span ±1 standard deviation across seeds. In the search-cost panel\neach bar splits into optimizer reasoning (the agent’s Proposer and Diagnoser calls) and trial evaluation (the RAG\ngeneration and judge scoring at each trial). Random search and MO-TPE propose configurations without a language\nmodel, so their cost is entirely trial evaluation. The embedding panel counts embedding-input tokens in millions,\none charge per distinct embedder and chunk-size configuration rather than per trial.\n\nD  Search cost and embedding compute     choose configurations without a language model\n                                            and spend nothing on reasoning. What raises the\nFigure 4 reports two costs of running each opti-   agent’s bill is the pipelines it evaluates. These are\nmizer on the three datasets of the Accuracy experi-   score-only runs, so cost is not an objective and noth-\nment, the dollar cost of the search and the embed-   ing steers the agent toward cheaper generators. It\nding compute it consumes. We count the latter as   knows from the knowledge base and the language\nembedding-input tokens, charged once per distinct   model’s own priors which generators are strong,\nembedder and chunk-size configuration, since each   and strong generators tend to cost more per token,\nindex is built once and reused across a run’s tri-   so its trials favor more capable, more expensive\nals. Bars are the mean over the 10 search seeds    configurations. However, reaching their accuracy\nand whiskers span ±1 standard deviation across   does not take the full budget. Its 10-trial checkpoint\nseeds. The methods differ most on embedding to-   recovers most of the agent’s final held-out accuracy\nkens used. The agent’s search consumes 11 to 16M    (Table 2) at $1.48 to $2.92 per run, comparable to\nembedding tokens per dataset, against 46 to 79M   random search and MO-TPE at $1.86 to $4.45.\nfor random search and 34 to 63M for MO-TPE,\nthree to five times fewer. Guided by the knowledge\nbase, it settles on a few strong embedders early and\nreuses their cached indexes, while random search\nand MO-TPE sample embedders and chunk sizes\nacross the whole space and pay for a fresh index\nbuild on each new combination.\n\n  In dollars the methods are closer, and the full\n30-trial agent costs more than the statistical base-\nlines. The gap is trial evaluation, not reasoning.\nIts Proposer and Diagnoser calls add only $0.71 to\n$0.79 per run, while random search and MO-TPE\n\n\n                                         16"
+    }
+  ],
+  "tables": [
+    {
+      "page": 13,
+      "bbox": [
+        307.0050772164614,
+        76.24600219726562,
+        529.5236105882484,
+        768.2114196777344
+      ],
+      "rows": [
+        [
+          "",
+          "neighborhood cross doc weight: 0.2\n_ _ _",
+          ""
+        ],
+        [
+          "",
+          "",
+          ""
+        ],
+        [
+          "",
+          "parsing: # OCR + tables on for the UniDoc PDFs",
+          ""
+        ],
+        [
+          "",
+          "parser: docling",
+          ""
+        ],
+        [
+          "",
+          "ocr: true",
+          ""
+        ],
+        [
+          "",
+          "table structure: true\n_",
+          ""
+        ],
+        [
+          "",
+          "",
+          ""
+        ],
+        [
+          "",
+          "search space: # dimensions searched\n_",
+          ""
+        ],
+        [
+          "",
+          "chunking: # how documents are split",
+          ""
+        ],
+        [
+          "",
+          "strategies: [recursive, fixed]",
+          ""
+        ],
+        [
+          "",
+          "chunk token size: [128, 256, 384, 512]\n_ _",
+          ""
+        ],
+        [
+          "",
+          "chunk token overlap: [0, 32, 48, 64]\n_ _",
+          ""
+        ],
+        [
+          "",
+          "",
+          ""
+        ],
+        [
+          "",
+          "embedding: # 13 retrievers",
+          ""
+        ],
+        [
+          "",
+          "models:",
+          ""
+        ],
+        [
+          "",
+          "- IEITYuan/Yuan-embedding-2.0-en",
+          ""
+        ],
+        [
+          "",
+          "- Qwen/Qwen3-Embedding-0.6B",
+          ""
+        ],
+        [
+          "",
+          "- ibm-granite/granite-embedding-english-r2",
+          ""
+        ],
+        [
+          "",
+          "- ibm-granite/granite-embedding-small-english-r2",
+          ""
+        ],
+        [
+          "",
+          "- intfloat/e5-large-v2",
+          ""
+        ],
+        [
+          "",
+          "- intfloat/multilingual-e5-large-instruct",
+          ""
+        ],
+        [
+          "",
+          "- BAAI/bge-large-en-v1.5",
+          ""
+        ],
+        [
+          "",
+          "- BAAI/bge-small-en-v1.5",
+          ""
+        ],
+        [
+          "",
+          "- BAAI/bge-m3",
+          ""
+        ],
+        [
+          "",
+          "- Snowflake/snowflake-arctic-embed-l-v2.0",
+          ""
+        ],
+        [
+          "",
+          "- Snowflake/snowflake-arctic-embed-xs",
+          ""
+        ],
+        [
+          "",
+          "- mixedbread-ai/mxbai-embed-large-v1",
+          ""
+        ],
+        [
+          "",
+          "- sentence-transformers/all-MiniLM-L6-v2",
+          ""
+        ],
+        [
+          "",
+          "",
+          ""
+        ],
+        [
+          "",
+          "retrieval:",
+          ""
+        ],
+        [
+          "",
+          "index types: [vector only, hybrid bm25 vector]\n_ _ _ _",
+          ""
+        ],
+        [
+          "",
+          "top k: { min: 3, max: 20 } # retrieved chunks\n_",
+          ""
+        ],
+        [
+          "",
+          "hybrid alpha: { min: 0.0, max: 1.0 } # lexical/dense\n_",
+          ""
+        ],
+        [
+          "",
+          "bm25 vector fusion: [alpha, rrf]\n_ _",
+          ""
+        ],
+        [
+          "",
+          "long context reorder: [false, true]\n_ _",
+          ""
+        ],
+        [
+          "",
+          "",
+          ""
+        ],
+        [
+          "",
+          "query expansion:\n_",
+          ""
+        ],
+        [
+          "",
+          "strategies: [none, hyde, multi query, query decompose]\n_ _",
+          ""
+        ],
+        [
+          "",
+          "models: [azure/gpt-4o-mini] # fixed expander",
+          ""
+        ],
+        [
+          "",
+          "",
+          ""
+        ],
+        [
+          "",
+          "reranker:",
+          ""
+        ],
+        [
+          "",
+          "models:",
+          ""
+        ],
+        [
+          "",
+          "- none",
+          ""
+        ],
+        [
+          "",
+          "- BAAI/bge-reranker-v2-m3",
+          ""
+        ],
+        [
+          "",
+          "- cross-encoder/ms-marco-MiniLM-L-6-v2",
+          ""
+        ],
+        [
+          "",
+          "- Alibaba-NLP/gte-reranker-modernbert-base",
+          ""
+        ],
+        [
+          "",
+          "- mixedbread-ai/mxbai-rerank-xsmall-v1",
+          ""
+        ],
+        [
+          "",
+          "top n: { min: 3, max: 10 } # reranked chunks",
+          ""
+        ],
+        [
+          "",
+          "_",
+          ""
+        ],
+        [
+          "",
+          "generator: # 35 answer LLMs",
+          ""
+        ],
+        [
+          "",
+          "models:",
+          ""
+        ],
+        [
+          "",
+          "- bedrock/us.amazon.nova-micro-v1:0",
+          ""
+        ],
+        [
+          "",
+          "- bedrock/us.amazon.nova-lite-v1:0",
+          ""
+        ],
+        [
+          "",
+          "- bedrock/us.amazon.nova-pro-v1:0",
+          ""
+        ],
+        [
+          "",
+          "- bedrock/google.gemma-3-4b-it",
+          ""
+        ],
+        [
+          "",
+          "- bedrock/google.gemma-3-12b-it",
+          ""
+        ],
+        [
+          "",
+          "- bedrock/google.gemma-3-27b-it",
+          ""
+        ],
+        [
+          "",
+          "- bedrock/us.meta.llama3-1-8b-instruct-v1:0",
+          ""
+        ],
+        [
+          "",
+          "- bedrock/us.meta.llama3-3-70b-instruct-v1:0",
+          ""
+        ],
+        [
+          "",
+          "- bedrock/us.meta.llama4-scout-17b-instruct-v1:0",
+          ""
+        ],
+        [
+          "",
+          "- bedrock/us.meta.llama4-maverick-17b-instruct-v1:0",
+          ""
+        ],
+        [
+          "",
+          "- bedrock/mistral.magistral-small-2509",
+          ""
+        ],
+        [
+          "",
+          "- bedrock/mistral.ministral-3-3b-instruct",
+          ""
+        ],
+        [
+          "",
+          "- bedrock/mistral.ministral-3-8b-instruct",
+          ""
+        ],
+        [
+          "",
+          "- bedrock/mistral.ministral-3-14b-instruct",
+          ""
+        ],
+        [
+          "",
+          "- bedrock/mistral.mistral-7b-instruct-v0:2",
+          ""
+        ],
+        [
+          "",
+          "- bedrock/mistral.mistral-large-3-675b-instruct",
+          ""
+        ],
+        [
+          "",
+          "- bedrock/mistral.mixtral-8x7b-instruct-v0:1",
+          ""
+        ],
+        [
+          "",
+          "- bedrock/nvidia.nemotron-nano-3-30b",
+          ""
+        ],
+        [
+          "",
+          "- bedrock/openai.gpt-oss-20b-1:0",
+          ""
+        ],
+        [
+          "",
+          "- bedrock/openai.gpt-oss-120b-1:0",
+          ""
+        ],
+        [
+          "",
+          "- bedrock/qwen.qwen3-32b-v1:0",
+          ""
+        ],
+        [
+          "",
+          "- bedrock/qwen.qwen3-coder-30b-a3b-v1:0",
+          ""
+        ],
+        [
+          "",
+          "- bedrock/zai.glm-4.7",
+          ""
+        ],
+        [
+          "",
+          "- azure/gpt-4o",
+          ""
+        ],
+        [
+          "",
+          "- azure/gpt-4o-mini",
+          ""
+        ],
+        [
+          "",
+          "- azure/gpt-4.1-mini",
+          ""
+        ],
+        [
+          "",
+          "- azure/gpt-4.1-nano",
+          ""
+        ],
+        [
+          "",
+          "- azure/o4-mini",
+          ""
+        ],
+        [
+          "",
+          "- azure/gpt-5-mini",
+          ""
+        ],
+        [
+          "",
+          "- azure/gpt-5-nano",
+          ""
+        ],
+        [
+          "",
+          "- azure/gpt-5.4-mini",
+          ""
+        ],
+        [
+          "",
+          "- azure/gpt-5.4-nano",
+          ""
+        ],
+        [
+          "",
+          "- vertex ai/gemini-2.5-flash",
+          ""
+        ],
+        [
+          "",
+          "_\n- vertex ai/gemini-2.5-flash-lite",
+          ""
+        ],
+        [
+          "",
+          "_\n- vertex ai/gemini-3.1-flash-lite-preview",
+          ""
+        ],
+        [
+          "",
+          "_\n# when true, trials may use reasoning or plain models,",
+          ""
+        ]
+      ]
+    },
+    {
+      "page": 13,
+      "bbox": [
+        71.72448079178973,
+        450.9864668412642,
+        294.25253047788044,
+        775.2250366210938
+      ],
+      "rows": [
+        [
+          "",
+          null,
+          null
+        ],
+        [
+          "",
+          "# Project configuration: corpus, optimizer models, exam",
+          ""
+        ],
+        [
+          "",
+          "# settings, and the search space. Provided by the user.",
+          ""
+        ],
+        [
+          "",
+          "",
+          ""
+        ],
+        [
+          "",
+          "meta:",
+          ""
+        ],
+        [
+          "",
+          "project name: unidoc-pareto\n_",
+          ""
+        ],
+        [
+          "",
+          "corpus path: ./corpus\n_",
+          ""
+        ],
+        [
+          "",
+          "# free-text hint read by the optimizer",
+          ""
+        ],
+        [
+          "",
+          "corpus description: |\n_",
+          ""
+        ],
+        [
+          "",
+          "Real-world healthcare PDFs and scanned page images:",
+          ""
+        ],
+        [
+          "",
+          "insurance forms, claims, clinical notes. Dense,",
+          ""
+        ],
+        [
+          "",
+          "domain-specific prose with tables and mixed layouts.",
+          ""
+        ],
+        [
+          "",
+          "max trials: 30 # search budget\n_",
+          ""
+        ],
+        [
+          "",
+          "cost aware: true # Pareto run; the Accuracy experiment\n_",
+          ""
+        ],
+        [
+          "",
+          "sets false",
+          ""
+        ],
+        [
+          "",
+          "",
+          ""
+        ],
+        [
+          "",
+          "model aliases: # map names to your deployments\n_",
+          ""
+        ],
+        [
+          "",
+          "azure/gpt-5-nano: <your-deployment>",
+          ""
+        ],
+        [
+          "",
+          "azure/gpt-5-mini: <your-deployment>",
+          ""
+        ],
+        [
+          "",
+          "azure/gpt-4.1-nano: <your-deployment>",
+          ""
+        ],
+        [
+          "",
+          "azure/gpt-4.1-mini: <your-deployment>",
+          ""
+        ],
+        [
+          "",
+          "",
+          ""
+        ],
+        [
+          "",
+          "# LLMs that drive the optimizer and grade answers",
+          ""
+        ],
+        [
+          "",
+          "agent:",
+          ""
+        ],
+        [
+          "",
+          "optimizer model: kimi-k2.5 # diagnose + propose\n_",
+          ""
+        ],
+        [
+          "",
+          "examiner model: minimax-m2.5 # compose exam\n_",
+          ""
+        ],
+        [
+          "",
+          "judge model: DeepSeek-V3.2 # grade answers\n_",
+          ""
+        ],
+        [
+          "",
+          "optimizer reasoning effort: medium\n_ _",
+          ""
+        ],
+        [
+          "",
+          "examiner reasoning effort: medium\n_ _",
+          ""
+        ],
+        [
+          "",
+          "",
+          ""
+        ],
+        [
+          "",
+          "examiner: # exam generation (skipped when an exam is",
+          ""
+        ],
+        [
+          "",
+          "supplied)",
+          ""
+        ],
+        [
+          "",
+          "exam size: 100\n_",
+          ""
+        ],
+        [
+          "",
+          "# seed this x exam size neighborhoods; the composer\n_",
+          ""
+        ],
+        [
+          "",
+          "# over-generates questions, then filter to exam size\n_",
+          ""
+        ],
+        [
+          "",
+          "initial question multiplier: 1.8\n_ _",
+          ""
+        ],
+        [
+          "",
+          "probe selection: true # keep discriminative items\n_",
+          ""
+        ],
+        [
+          "",
+          "neighborhood min chunks: 18 # context per call\n_ _",
+          ""
+        ],
+        [
+          "",
+          "neighborhood min words: 5000\n_ _",
+          ""
+        ],
+        [
+          "",
+          "# neighborhood mix, favoring same-document spans",
+          ""
+        ],
+        [
+          "",
+          "neighborhood same doc weight: 0.8\n_ _ _",
+          ""
+        ]
+      ]
+    },
+    {
+      "page": 14,
+      "bbox": [
+        71.69616741604275,
+        76.24600219726562,
+        294.28093973795575,
+        121.35701904296874
+      ],
+      "rows": [
+        [
+          "",
+          "# passing reasoning params to LiteLLM where supported",
+          ""
+        ],
+        [
+          "",
+          "reasoning: true",
+          ""
+        ],
+        [
+          "",
+          "reasoning effort: medium # when reasoning is on\n_",
+          ""
+        ],
+        [
+          "",
+          "",
+          ""
+        ],
+        [
+          "",
+          "temperature: { min: 1.0, max: 1.0 }",
+          ""
+        ],
+        [
+          "",
+          null,
+          null
+        ]
+      ]
+    },
+    {
+      "page": 16,
+      "bbox": [
+        70.86599731445312,
+        51.104759216308594,
+        524.41650390625,
+        347.7522888183594
+      ],
+      "rows": [
+        [
+          "",
+          null,
+          null
+        ],
+        [
+          "",
+          null,
+          null
+        ],
+        [
+          "Figure 4: Search cost and embedding compute on the thre",
+          "e datasets of th",
+          "e Accuracy experiment. Bars show the"
+        ]
+      ]
+    }
+  ]
+}

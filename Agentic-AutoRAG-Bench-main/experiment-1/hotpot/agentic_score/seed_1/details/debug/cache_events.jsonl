@@ -1,0 +1,3 @@
+{"trial_number": 1, "cache_kind": "embeddings", "cache_key": "e69cb606316673c9", "tokens_credited": 2690621, "embedding_model": "IEITYuan/Yuan-embedding-2.0-en", "phase": "trial"}
+{"trial_number": 2, "cache_kind": "embeddings", "cache_key": "595052c128543f3e", "tokens_credited": 2691935, "embedding_model": "IEITYuan/Yuan-embedding-2.0-en", "phase": "trial"}
+{"trial_number": 11, "cache_kind": "embeddings", "cache_key": "1e46b51715e18057", "tokens_credited": 2735460, "embedding_model": "BAAI/bge-m3", "phase": "trial"}

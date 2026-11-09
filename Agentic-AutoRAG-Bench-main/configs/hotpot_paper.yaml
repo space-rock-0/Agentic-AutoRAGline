@@ -1,0 +1,68 @@
+# Paper-scale matrix config — HotpotQA score-only EMNLP Table 1 run.
+# (A Pareto matrix config can live alongside this once written; it would
+# flip ``meta.cost_aware`` to true in the project YAML and drop
+# ``agentic_score`` in favour of ``agentic_cost``.)
+#
+# Default iteration knobs assume the wide search space defined in
+# ``hotpot_paper_project.yaml`` (13 embedders × 31 generators × continuous
+# top_k/hybrid_alpha × ...). Dial down inline overrides for dev runs.
+#
+# Accuracy-experiment headline slate (locked, 5 search methods). Under test:
+# agentic_score (ours: KB on, diagnosis on). Ablated LLM-optimizer:
+# agentic_nokb_nodiag (KB off, diagnosis off, compact config→score history).
+# Statistical rivals: random (floor) → motpe (cold group-multivariate MO-TPE,
+# syftr-class) → motpe_warm (motpe + a free, uncounted transfer prior seeded
+# from this run's random cell). agentic_cost belongs to the Pareto experiment
+# (unidoc), not here. kb_greedy is a single-config reference run via its own
+# command (`kb-greedy`), not a matrix method.
+#
+# The single-component ablations (agentic_nodiag, agentic_nokb) are NOT part of
+# this matrix and were not run for the paper; configs/hotpot_ablation.yaml runs
+# them on demand, into their own output_root.
+
+project_config: ./hotpot_paper_project.yaml
+
+methods:
+  - agentic_score      # full agentic: KB on, diagnosis on — method under test
+  - agentic_nokb_nodiag  # KB off, diagnosis off, compact (config→score) history proposer
+  - motpe              # cold group-multivariate MO-TPE (syftr-class statistical search)
+  - motpe_warm         # MO-TPE + free uncounted transfer prior from random (runs after random)
+  - random             # exploration floor (also motpe_warm's transfer source)
+
+seeds: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+
+budget:
+  max_trials: 30
+
+# Per-method early-stopping checkpoints: after a method's full
+# ``max_trials``-budget search finishes, also evaluate the best config seen
+# in ``history[:k]`` on the held-out QA. Writes a sibling
+# ``<method>@<k>/seed_<n>/`` directory per checkpoint. Lets the paper show
+# "ours at trial k" vs. "baseline at trial max_trials" without paying for
+# extra search trials. Baselines are not checkpointed (saves held-out
+# judge cost — the headline question is "how does ours catch up to
+# MO-TPE/random when given fewer trials", not the inverse).
+checkpoints:
+  agentic_score: [10, 20]
+
+benchmark:
+  name: hotpot_qa
+  split: validation
+  sample_size: 2000
+  prep_seed: 42
+  output_dir: ./benchmark_data/hotpot_val_2000
+  # Pinned HuggingFace dataset revision, matching the sha in
+  # benchmark_data/<ds>/metadata.json. Without it a rerun silently prepares
+  # whatever is at head, which is a different corpus from the paper's.
+  hf_revision: 1908d6afbbead072334abe2965f91bd2709910ab
+
+hold_out:
+  # Stratified, disjoint held-out slice (prepare-splits) — replaces the biased
+  # contiguous qa.json[:limit] slice. Already excludes doc-less rows and is
+  # exactly ~300 stratified questions, so limit is null (use all of it).
+  qa_path: ./benchmark_data/hotpot_val_2000/splits/holdout_qa.json
+  limit: null
+  judge_model: azure_ai/DeepSeek-V3.2
+  concurrency: 8
+
+output_root: ./experiment-1/hotpot

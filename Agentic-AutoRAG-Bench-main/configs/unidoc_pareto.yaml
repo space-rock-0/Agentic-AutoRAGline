@@ -1,0 +1,34 @@
+# Entry config for the `pareto` command: run the cost-aware Pareto comparison —
+# agentic_cost (full agentic) vs random (floor + transfer source) vs motpe (cold
+# two-objective MO-TPE) vs motpe_warm (same MO-TPE warm-started from random; the
+# cold→warm frontier gap is the transfer-prior's value) — on the UniDoc (healthcare) PDF
+# corpus and render the multi-frontier cost-vs-accuracy figure with a
+# shared-reference-point hypervolume. No held-out QA — trials are scored on the
+# optimizer's own self-generated exam.
+#
+#   uv run agentic-autorag-bench pareto --config configs/unidoc_pareto.yaml
+
+project_config: ./unidoc_pareto_project.yaml
+
+seed: 1
+
+# Method slate + seeds for the full Exp-2 Pareto sweep. The `pareto` CLI and the
+# scripts/run_experiment2.py scheduler select subsets of these; when neither is
+# passed the full list runs (all four methods, single `seed` above). `random`
+# is motpe_warm's on-disk transfer source, so a motpe_warm cell requires the
+# same-seed random cell complete first (the scheduler encodes that edge).
+methods: [agentic_cost, random, motpe, motpe_warm]
+seeds: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+
+budget:
+  max_trials: 30
+
+# Corpus is downloaded on first run if meta.corpus_path (in the project config)
+# is empty. PDFs + a few first-page images, to exercise Docling on more file
+# types. ~230 PDFs matches the prior UniDoc download default.
+corpus:
+  domain: healthcare
+  max_pdfs: 230
+  max_images: 20
+
+output_root: ./experiment-2/unidoc

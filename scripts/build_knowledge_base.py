@@ -1,0 +1,554 @@
+"""Build the knowledge base YAML files from external data sources.
+
+Sources:
+  - Artificial Analysis API  → LLM benchmarks, throughput, fallback pricing
+  - LiteLLM model_cost dict  → AA-slug ↔ LiteLLM-id mapping universe only
+  - MTEB benchmark cache     → Embedding model benchmarks
+
+LLM pricing is resolved at runtime from the configured LiteLLM id; the AA
+price written here is the runtime fallback when LiteLLM has no entry for
+the user's id (see ``agentic_autorag.config.knowledge_base._resolve_pricing``).
+
+Usage:
+  uv run python scripts/build_knowledge_base.py
+  uv run python scripts/build_knowledge_base.py --llm-only
+  uv run python scripts/build_knowledge_base.py --embedding-only
+  uv run python scripts/build_knowledge_base.py --output-dir agentic_autorag/knowledge_base/
+  uv run python scripts/build_knowledge_base.py --refresh-aa-cache  # force re-fetch
+  uv run python scripts/build_knowledge_base.py --use-cache-only    # skip API entirely
+
+The AA API response is cached at ``<output-dir>/_aa_response_cache.json``.
+Default behaviour: reuse the cache silently if present; only re-fetch when
+``--refresh-aa-cache`` is given.
+
+Requires:
+  ARTIFICIAL_ANALYSIS_API_KEY environment variable (only when the cache is
+  absent or ``--refresh-aa-cache`` is used).
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import json
+import logging
+import math
+import os
+import re
+from collections import Counter, defaultdict
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import requests
+import yaml
+from dotenv import load_dotenv
+
+from agentic_autorag.config.aa_matcher import VARIANT_SUFFIXES, build_aa_to_litellm_mapping
+from agentic_autorag.config.knowledge_base import _route_priority
+
+if TYPE_CHECKING:
+    from mteb.benchmarks.benchmark import Benchmark
+    from mteb.results.benchmark_results import BenchmarkResults
+
+load_dotenv()
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+logger = logging.getLogger(__name__)
+
+LLM_BENCHMARKS = ["artificial_analysis_intelligence_index"]
+EMBEDDING_TASKS = ["Retrieval", "STS", "Reranking"]
+EMBEDDING_BENCHMARK = "MTEB(eng, v2)"
+# The leaderboard blanks a task type as soon as one of its tasks is missing for
+# a model. The knowledge base averages the tasks the model did run instead, as
+# long as it covers at least this share of the type's tasks.
+MIN_TASK_COVERAGE = 0.5
+# Parameter counts are stored in billions at the leaderboard's precision.
+PARAMS_PER_BILLION = 1e9
+PARAMETER_DECIMALS = 3
+# The Free route accepts every key tier and carries all fields the knowledge base uses.
+AA_API_URL = "https://artificialanalysis.ai/api/v2/language/models/free"
+AA_CACHE_FILENAME = "_aa_response_cache.json"
+
+
+def _strip_variant_suffixes(slug: str) -> tuple[str, str] | tuple[None, None]:
+    """Recursively strip known AA variant suffixes from a slug.
+
+    Returns ``(base_slug, variant_type)`` where *variant_type* is a ``-``
+    joined string of all stripped suffixes (e.g. ``"reasoning-low"`` for
+    ``nova-2-0-lite-reasoning-low``).  Returns ``(None, None)`` when no
+    suffix could be removed.
+    """
+    stripped_parts: list[str] = []
+    current = slug
+    while True:
+        matched = False
+        for suffix in VARIANT_SUFFIXES:
+            if current.endswith(suffix):
+                # suffix includes the leading '-', strip it for the type label
+                stripped_parts.append(suffix.lstrip("-"))
+                current = current[: -len(suffix)]
+                matched = True
+                break
+        if not matched:
+            break
+    if not stripped_parts:
+        return None, None
+    # Parts were collected inner→outer; reverse for natural reading order
+    variant_type = "-".join(reversed(stripped_parts))
+    return current, variant_type
+
+
+def _detect_variants(
+    aa_slugs: list[str],
+    all_aa_slugs: set[str],
+) -> dict[str, tuple[str, str]]:
+    """Detect AA variant slugs and link them to their base.
+
+    Runs for every AA slug, not only the unmatched ones — so a variant that
+    happened to find LiteLLM matches (e.g. ``grok-4-1-fast-reasoning``) still
+    gets ``base_slug`` linkage that ``reasoning_mode.select_pair`` needs.
+    The ``base in all_aa_slugs`` guard prevents false positives like
+    ``o3-mini-high`` when AA has no ``o3-mini`` base entry.
+
+    Returns a dict of ``{variant_slug: (base_slug, variant_type)}``.
+    """
+    variants: dict[str, tuple[str, str]] = {}
+    for slug in aa_slugs:
+        base, vtype = _strip_variant_suffixes(slug)
+        if base is not None and base in all_aa_slugs:
+            variants[slug] = (base, vtype)
+    return variants
+
+
+def _build_name_mapping(aa_slugs: list[str], litellm_keys: list[str]) -> dict[str, list[str]]:
+    """Map each AA slug to matching LiteLLM model keys.
+
+    Delegates to :func:`agentic_autorag.config.aa_matcher.build_aa_to_litellm_mapping`,
+    which assigns each LiteLLM key to its single best AA slug using a multi-tier
+    priority (exact ≫ token-multiset equality ≫ subset with modality safety).
+    """
+    return build_aa_to_litellm_mapping(aa_slugs, litellm_keys)
+
+
+def _fetch_aa_models_remote(api_key: str) -> tuple[list[dict], dict]:
+    """Fetch every page of AA language models; return ``(models, meta)``."""
+    logger.info("Fetching models from Artificial Analysis API…")
+    models: list[dict] = []
+    page = 1
+    while True:
+        resp = requests.get(AA_API_URL, headers={"x-api-key": api_key}, params={"page": page}, timeout=30)
+        resp.raise_for_status()
+        body = resp.json()
+        models.extend(body.get("data", []))
+        if not body.get("pagination", {}).get("has_more"):
+            break
+        page += 1
+    meta = {"source_url": AA_API_URL, "intelligence_index_version": body.get("intelligence_index_version")}
+    logger.info("  Retrieved %d models from AA", len(models))
+    return models, meta
+
+
+def _write_aa_cache(cache_path: Path, models: list[dict], meta: dict) -> None:
+    payload = {
+        "fetched_at": datetime.datetime.now(datetime.UTC).isoformat(),
+        **meta,
+        "data": models,
+    }
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(cache_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def _read_aa_cache(cache_path: Path) -> tuple[list[dict], str] | None:
+    if not cache_path.exists():
+        return None
+    with open(cache_path, encoding="utf-8") as f:
+        payload = json.load(f)
+    return payload.get("data", []), payload.get("fetched_at", "unknown")
+
+
+def _load_aa_models(api_key: str | None, cache_path: Path, *, refresh: bool, cache_only: bool) -> list[dict]:
+    """Return AA models, preferring the on-disk cache.
+
+    Order:
+      1. ``cache_only=True``  → use cache, fail if absent.
+      2. ``refresh=True``     → re-fetch and overwrite cache.
+      3. cache present        → use silently, log age.
+      4. cache absent         → fetch and write cache.
+    """
+    cached = _read_aa_cache(cache_path)
+
+    if cache_only:
+        if cached is None:
+            raise FileNotFoundError(f"--use-cache-only set but no AA cache at {cache_path}")
+        models, fetched_at = cached
+        logger.info("  Using AA cache (%d models, fetched %s)", len(models), fetched_at)
+        return models
+
+    if not refresh and cached is not None:
+        models, fetched_at = cached
+        logger.info(
+            "  Using AA cache (%d models, fetched %s) — pass --refresh-aa-cache to re-fetch", len(models), fetched_at
+        )
+        return models
+
+    if not api_key:
+        raise RuntimeError("ARTIFICIAL_ANALYSIS_API_KEY required to fetch AA data (cache miss or --refresh-aa-cache)")
+
+    models, meta = _fetch_aa_models_remote(api_key)
+    _write_aa_cache(cache_path, models, meta)
+    logger.info("  Wrote AA cache to %s", cache_path)
+    return models
+
+
+def _load_litellm_ids() -> list[str]:
+    """Return every LiteLLM model id the matcher should consider.
+
+    Combines ``litellm.model_cost`` keys (priced entries) with
+    ``litellm.models_by_provider`` (all supported IDs, including unpriced
+    ones like ``vertex_ai/gemini-2.5-flash``).
+    """
+    import litellm  # noqa: PLC0415
+
+    all_ids: set[str] = set(litellm.model_cost.keys())  # type: ignore[attr-defined]
+    for provider, models in litellm.models_by_provider.items():
+        for model_name in models:
+            full_id = model_name if model_name.startswith(f"{provider}/") else f"{provider}/{model_name}"
+            all_ids.add(full_id)
+    logger.info("  Loaded %d LiteLLM IDs", len(all_ids))
+    return sorted(all_ids)
+
+
+def _litellm_context_length(litellm_ids: list[str]) -> tuple[int | None, int | None]:
+    """Return (max_input_tokens, max_output_tokens) from the highest-priority
+    LiteLLM sibling id that carries them, or (None, None).
+
+    Context length is structural per-route metadata, not pricing — different
+    regions of the same model share it — so it's safe to bake into the KB at
+    build time even when AA owns the displayed price.
+    """
+    import litellm  # noqa: PLC0415
+
+    for lid in sorted(litellm_ids, key=_route_priority):
+        try:
+            info = litellm.get_model_info(lid)
+        except Exception:  # noqa: BLE001
+            continue
+        if info and info.get("max_input_tokens"):
+            return info.get("max_input_tokens"), info.get("max_output_tokens")
+    return None, None
+
+
+def _aa_pricing(aa_model: dict, litellm_ids: list[str]) -> dict | None:
+    """Extract AA's per-1M-token prices + LiteLLM-sourced context length."""
+    raw = aa_model.get("pricing") or {}
+    input_1m = raw.get("price_1m_input_tokens")
+    output_1m = raw.get("price_1m_output_tokens")
+    if input_1m is None:
+        return None
+    max_in, max_out = _litellm_context_length(litellm_ids)
+    return {
+        "input_per_1m_tokens": input_1m,
+        "output_per_1m_tokens": output_1m,
+        "max_input_tokens": max_in,
+        "max_output_tokens": max_out,
+    }
+
+
+def build_llm_knowledge_base(
+    output_dir: Path,
+    api_key: str | None,
+    *,
+    refresh_aa_cache: bool = False,
+    use_cache_only: bool = False,
+) -> None:
+    """Fetch AA + LiteLLM data and write agentic_autorag/knowledge_base/llms.yaml."""
+    cache_path = output_dir / AA_CACHE_FILENAME
+    aa_models = _load_aa_models(api_key, cache_path, refresh=refresh_aa_cache, cache_only=use_cache_only)
+    all_litellm_ids = _load_litellm_ids()
+
+    aa_slugs = [m["slug"] for m in aa_models]
+    mapping = _build_name_mapping(aa_slugs, all_litellm_ids)
+
+    matched = sum(1 for v in mapping.values() if v)
+    logger.info("  Name mapping: %d/%d AA models matched to LiteLLM keys", matched, len(aa_models))
+    unmatched = [s for s, v in mapping.items() if not v]
+    if unmatched:
+        logger.warning("  Unmatched AA slugs (%d): %s", len(unmatched), unmatched[:20])
+
+    all_aa_slugs = set(aa_slugs)
+    variants = _detect_variants(aa_slugs, all_aa_slugs)
+    logger.info("  Variant detection: %d slugs linked to base models", len(variants))
+
+    models_out: dict[str, dict] = {}
+    for aa in aa_models:
+        slug = aa["slug"]
+        litellm_ids = mapping.get(slug, [])
+
+        evals = aa.get("evaluations") or {}
+        benchmarks: dict[str, float | None] = {}
+        for b in LLM_BENCHMARKS:
+            val = evals.get(b)
+            benchmarks[b] = round(val, 4) if val is not None else None
+
+        raw_perf = aa.get("performance") or {}
+        perf: dict[str, float | None] = {
+            "median_output_tokens_per_second": raw_perf.get("median_output_tokens_per_second"),
+            "median_time_to_first_token_seconds": raw_perf.get("median_time_to_first_token_seconds"),
+        }
+
+        creator = aa.get("model_creator") or {}
+        entry: dict = {
+            "name": aa["name"],
+            "slug": slug,
+            "creator": creator.get("name", ""),
+            "release_date": aa.get("release_date"),
+            "litellm_ids": litellm_ids,
+            "benchmarks": benchmarks,
+            "performance": perf,
+            "pricing": _aa_pricing(aa, litellm_ids),
+        }
+
+        if slug in variants:
+            base_slug, variant_type = variants[slug]
+            entry["base_slug"] = base_slug
+            entry["variant_type"] = variant_type
+
+        models_out[slug] = entry
+
+    # AA variants without their own price block inherit from the base. Most
+    # AA-listed reasoning variants do carry their own price; this only fires
+    # when AA omits it.
+    for entry in models_out.values():
+        base_slug = entry.get("base_slug")
+        if not base_slug or entry.get("pricing") is not None:
+            continue
+        base_entry = models_out.get(base_slug)
+        if base_entry and base_entry.get("pricing"):
+            entry["pricing"] = dict(base_entry["pricing"])
+
+    output = {
+        "_metadata": {
+            "built_at": datetime.datetime.now(datetime.UTC).isoformat(),
+            "aa_model_count": len(aa_models),
+            "litellm_key_count": len(all_litellm_ids),
+            "matched_count": matched,
+        },
+        "models": models_out,
+    }
+
+    out_path = output_dir / "llms.yaml"
+    with open(out_path, "w", encoding="utf-8") as f:
+        yaml.dump(output, f, allow_unicode=True, sort_keys=False, default_flow_style=False)
+    logger.info("Wrote %s (%d models)", out_path, len(models_out))
+
+
+def _to_float(val: object) -> float | None:
+    try:
+        f = float(val) if val is not None else None  # type: ignore[arg-type]
+        return None if f is not None and math.isnan(f) else f
+    except (ValueError, TypeError):
+        return None
+
+
+def _partial_type_means(results: BenchmarkResults, benchmark: Benchmark) -> dict[str, dict[str, tuple[float, float]]]:
+    """Per-task-type mean over the tasks each model has run, with the covered share.
+
+    Reads the leaderboard's own long frame (one row per task, split, and
+    subset), so the means equal ``get_benchmark_result`` wherever a model
+    covers every task of a type. Types below ``MIN_TASK_COVERAGE`` are omitted.
+    """
+    import polars as pl  # noqa: PLC0415
+
+    task_type = {task.metadata.name: task.metadata.type for task in benchmark.tasks}
+    tasks_per_type = Counter(task_type.values())
+    per_task = results._to_results_df(benchmark.tasks).group_by(["model_name", "task_name"]).agg(pl.col("score").mean())
+
+    scores_by_model: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    for model, task, score in per_task.iter_rows():
+        if score is not None and task in task_type:
+            scores_by_model[model][task_type[task]].append(score)
+
+    means: dict[str, dict[str, tuple[float, float]]] = {}
+    for model, by_type in scores_by_model.items():
+        means[model] = {}
+        for task_kind, values in by_type.items():
+            coverage = len(values) / tasks_per_type[task_kind]
+            if coverage >= MIN_TASK_COVERAGE:
+                means[model][task_kind] = (sum(values) / len(values), coverage)
+    return means
+
+
+def _model_memory_mb(hf_id: str) -> float | None:
+    """Memory footprint from mteb's model registry, None for models it does not know."""
+    import mteb  # noqa: PLC0415
+
+    try:
+        return mteb.get_model_meta(hf_id).memory_usage_mb
+    except (KeyError, ValueError):
+        return None
+
+
+def _embedding_entry(
+    hf_id: str,
+    type_means: dict[str, dict[str, tuple[float, float]]],
+    *,
+    parameters_billions: float | None,
+    memory_usage_mb: float | None,
+    embedding_dimensions: float | None,
+    max_tokens: float | None,
+) -> dict:
+    scores: dict[str, float | None] = {}
+    coverage: dict[str, float] = {}
+    for task_kind in EMBEDDING_TASKS:
+        mean_and_coverage = type_means.get(hf_id, {}).get(task_kind)
+        scores[task_kind.lower()] = round(mean_and_coverage[0], 4) if mean_and_coverage else None
+        if mean_and_coverage:
+            coverage[task_kind.lower()] = round(mean_and_coverage[1], 2)
+    return {
+        "hf_id": hf_id,
+        "parameters_billions": parameters_billions,
+        "memory_usage_mb": memory_usage_mb,
+        "embedding_dimensions": int(embedding_dimensions) if embedding_dimensions is not None else None,
+        "max_tokens": int(max_tokens) if max_tokens is not None else None,
+        "scores": scores,
+        "score_coverage": coverage,
+    }
+
+
+def build_embedding_knowledge_base(output_dir: Path) -> None:
+    """Fetch MTEB results and write agentic_autorag/knowledge_base/embeddings.yaml."""
+    import mteb  # noqa: PLC0415
+
+    logger.info("Loading MTEB benchmark results…")
+    benchmark = mteb.get_benchmark(EMBEDDING_BENCHMARK)
+    cache = mteb.ResultCache()
+    logger.info("  Downloading results from remote (this may take a few minutes)…")
+    cache.download_from_remote()
+    results = cache.load_results(tasks=benchmark)
+    df = results.get_benchmark_result()
+    type_means = _partial_type_means(results, benchmark)
+
+    logger.info("  Loaded results for %d models", len(df))
+
+    models_out: dict[str, dict] = {}
+    for _, row in df.iterrows():
+        raw_model = str(row.get("Model", ""))
+        url_match = re.search(r"\(https://huggingface\.co/([^)]+)\)", raw_model)
+        hf_id = url_match.group(1) if url_match else re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", raw_model).strip()
+
+        if not hf_id:
+            continue
+
+        models_out[hf_id] = _embedding_entry(
+            hf_id,
+            type_means,
+            parameters_billions=_to_float(row.get("Total Parameters (B)")),
+            memory_usage_mb=_model_memory_mb(hf_id),
+            embedding_dimensions=_to_float(row.get("Embedding Dimensions")),
+            max_tokens=_to_float(row.get("Max Tokens")),
+        )
+
+    # The leaderboard frame only lists models the installed mteb registry knows,
+    # so models added or renamed upstream after that release are missing from it.
+    # Their results carry the model's metadata alongside the scores.
+    for model_result in results.model_results:
+        hf_id = model_result.model_name
+        if hf_id in models_out or not any(t in type_means.get(hf_id, {}) for t in EMBEDDING_TASKS):
+            continue
+        meta_path = (
+            cache.get_task_result_path(
+                model_result.task_results[0].task_name, hf_id, model_result.model_revision, remote=True
+            ).parent
+            / "model_meta.json"
+        )
+        with open(meta_path, encoding="utf-8") as f:
+            meta = json.load(f)
+        n_parameters = _to_float(meta.get("n_parameters"))
+        models_out[hf_id] = _embedding_entry(
+            hf_id,
+            type_means,
+            parameters_billions=round(n_parameters / PARAMS_PER_BILLION, PARAMETER_DECIMALS)
+            if n_parameters is not None
+            else None,
+            memory_usage_mb=_to_float(meta.get("memory_usage_mb")),
+            embedding_dimensions=_to_float(meta.get("embed_dim")),
+            max_tokens=_to_float(meta.get("max_tokens")),
+        )
+    logger.info("  Kept %d models (%d from the leaderboard frame)", len(models_out), len(df))
+
+    output = {
+        "_metadata": {
+            "built_at": datetime.datetime.now(datetime.UTC).isoformat(),
+            "benchmark": EMBEDDING_BENCHMARK,
+            "model_count": len(models_out),
+            "tasks_included": EMBEDDING_TASKS,
+            "min_task_coverage": MIN_TASK_COVERAGE,
+        },
+        "models": models_out,
+    }
+
+    out_path = output_dir / "embeddings.yaml"
+    with open(out_path, "w", encoding="utf-8") as f:
+        yaml.dump(output, f, allow_unicode=True, sort_keys=False, default_flow_style=False)
+    logger.info("Wrote %s (%d models)", out_path, len(models_out))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Build Agentic AutoRAG knowledge base YAML files.")
+    parser.add_argument("--output-dir", default="agentic_autorag/knowledge_base", help="Directory to write YAML files")
+    parser.add_argument("--llm-only", action="store_true", help="Only build llms.yaml")
+    parser.add_argument("--embedding-only", action="store_true", help="Only build embeddings.yaml")
+    parser.add_argument("--aa-api-key", default=None, help="Artificial Analysis API key (overrides env var)")
+    parser.add_argument(
+        "--refresh-aa-cache",
+        action="store_true",
+        help="Force re-fetch of the AA API response and overwrite the on-disk cache.",
+    )
+    parser.add_argument(
+        "--use-cache-only",
+        action="store_true",
+        help="Use the on-disk AA cache only; never hit the API (fails if cache is absent).",
+    )
+    args = parser.parse_args()
+
+    if args.refresh_aa_cache and args.use_cache_only:
+        parser.error("--refresh-aa-cache and --use-cache-only are mutually exclusive")
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    build_llm = not args.embedding_only
+    build_embed = not args.llm_only
+    failed: list[str] = []
+
+    if build_llm:
+        api_key = args.aa_api_key or os.environ.get("ARTIFICIAL_ANALYSIS_API_KEY")
+        try:
+            build_llm_knowledge_base(
+                output_dir,
+                api_key,
+                refresh_aa_cache=args.refresh_aa_cache,
+                use_cache_only=args.use_cache_only,
+            )
+        except Exception:
+            logger.exception("Failed to build LLM knowledge base")
+            failed.append("llms.yaml")
+
+    if build_embed:
+        try:
+            build_embedding_knowledge_base(output_dir)
+        except Exception:
+            logger.exception("Failed to build embedding knowledge base")
+            failed.append("embeddings.yaml")
+
+    if failed:
+        raise SystemExit(f"Failed to build: {', '.join(failed)}")
+
+    logger.info(
+        "Done. Static files (rerankers.yaml, parameter_descriptions.yaml) are hand-authored — no rebuild needed."
+    )
+
+
+if __name__ == "__main__":
+    main()

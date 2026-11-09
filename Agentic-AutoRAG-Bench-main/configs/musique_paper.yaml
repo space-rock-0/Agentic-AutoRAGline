@@ -1,0 +1,44 @@
+# Paper-scale matrix config — score-only EMNLP Table 1 run on MuSiQue.
+# Mirrors hotpot_paper.yaml (same methods, seeds, budget, checkpoints, hold-out)
+# so the two benchmarks differ only in dataset.
+#
+# Run a single method with: -m random  (or any subset present in `methods`).
+
+project_config: ./musique_paper_project.yaml
+
+methods:
+  - agentic_score      # full agentic: KB on, diagnosis on — method under test
+  - agentic_nokb_nodiag  # KB off, diagnosis off, compact (config→score) history proposer
+  - motpe              # cold group-multivariate MO-TPE (syftr-class statistical search)
+  - motpe_warm         # MO-TPE + free uncounted transfer prior from random (runs after random)
+  - random             # exploration floor (also motpe_warm's transfer source)
+
+seeds: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+
+budget:
+  max_trials: 30
+
+checkpoints:
+  agentic_score: [10, 20]
+
+benchmark:
+  name: musique
+  split: validation
+  sample_size: 2417
+  prep_seed: 42
+  output_dir: ./benchmark_data/musique_val_2417
+  # Pinned HuggingFace dataset revision, matching the sha in
+  # benchmark_data/<ds>/metadata.json. Without it a rerun silently prepares
+  # whatever is at head, which is a different corpus from the paper's.
+  hf_revision: c8f4f8c9465fb69d31a8eae894c3fd509c4ca321
+
+hold_out:
+  # Stratified, disjoint held-out slice (prepare-splits) — replaces the biased
+  # contiguous qa.json[:limit] slice, which on MuSiQue's hop-sorted pool
+  # returned 100% 2-hop. Already ~300 stratified questions, so limit is null.
+  qa_path: ./benchmark_data/musique_val_2417/splits/holdout_qa.json
+  limit: null
+  judge_model: azure_ai/DeepSeek-V3.2
+  concurrency: 8
+
+output_root: ./experiment-1/musique

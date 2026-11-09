@@ -1,0 +1,261 @@
+{
+  "updated_at": "2026-07-18T06:14:47Z",
+  "pid": 76011,
+  "workers": 2,
+  "output_root": "/home/ordenter/ASL/autorag-workspace/agentic-autorag-bench/experiment-2/unidoc",
+  "max_trials": 30,
+  "counts": {
+    "pending": 0,
+    "running": 0,
+    "done": 30,
+    "failed": 0,
+    "blocked": 0
+  },
+  "setup_done": true,
+  "methods_done": "28/28",
+  "finalized": true,
+  "eta_hours": 0.0,
+  "running": [],
+  "units": [
+    {
+      "key": "setup",
+      "kind": "setup",
+      "state": "done",
+      "attempts": 0,
+      "rc": null,
+      "last_error": ""
+    },
+    {
+      "key": "agentic_cost/seed_4",
+      "kind": "method",
+      "state": "done",
+      "attempts": 1,
+      "rc": 0,
+      "last_error": ""
+    },
+    {
+      "key": "random/seed_4",
+      "kind": "method",
+      "state": "done",
+      "attempts": 1,
+      "rc": 0,
+      "last_error": ""
+    },
+    {
+      "key": "motpe/seed_4",
+      "kind": "method",
+      "state": "done",
+      "attempts": 1,
+      "rc": 0,
+      "last_error": ""
+    },
+    {
+      "key": "motpe_warm/seed_4",
+      "kind": "method",
+      "state": "done",
+      "attempts": 1,
+      "rc": 0,
+      "last_error": ""
+    },
+    {
+      "key": "agentic_cost/seed_5",
+      "kind": "method",
+      "state": "done",
+      "attempts": 1,
+      "rc": 0,
+      "last_error": ""
+    },
+    {
+      "key": "random/seed_5",
+      "kind": "method",
+      "state": "done",
+      "attempts": 1,
+      "rc": 0,
+      "last_error": ""
+    },
+    {
+      "key": "motpe/seed_5",
+      "kind": "method",
+      "state": "done",
+      "attempts": 1,
+      "rc": 0,
+      "last_error": ""
+    },
+    {
+      "key": "motpe_warm/seed_5",
+      "kind": "method",
+      "state": "done",
+      "attempts": 1,
+      "rc": 0,
+      "last_error": ""
+    },
+    {
+      "key": "agentic_cost/seed_6",
+      "kind": "method",
+      "state": "done",
+      "attempts": 1,
+      "rc": 0,
+      "last_error": ""
+    },
+    {
+      "key": "random/seed_6",
+      "kind": "method",
+      "state": "done",
+      "attempts": 1,
+      "rc": 0,
+      "last_error": ""
+    },
+    {
+      "key": "motpe/seed_6",
+      "kind": "method",
+      "state": "done",
+      "attempts": 2,
+      "rc": 0,
+      "last_error": "incomplete-after-exit0"
+    },
+    {
+      "key": "motpe_warm/seed_6",
+      "kind": "method",
+      "state": "done",
+      "attempts": 1,
+      "rc": 0,
+      "last_error": ""
+    },
+    {
+      "key": "agentic_cost/seed_7",
+      "kind": "method",
+      "state": "done",
+      "attempts": 1,
+      "rc": 0,
+      "last_error": ""
+    },
+    {
+      "key": "random/seed_7",
+      "kind": "method",
+      "state": "done",
+      "attempts": 1,
+      "rc": 0,
+      "last_error": ""
+    },
+    {
+      "key": "motpe/seed_7",
+      "kind": "method",
+      "state": "done",
+      "attempts": 1,
+      "rc": 0,
+      "last_error": ""
+    },
+    {
+      "key": "motpe_warm/seed_7",
+      "kind": "method",
+      "state": "done",
+      "attempts": 2,
+      "rc": 0,
+      "last_error": "incomplete-after-exit0"
+    },
+    {
+      "key": "agentic_cost/seed_8",
+      "kind": "method",
+      "state": "done",
+      "attempts": 1,
+      "rc": 0,
+      "last_error": ""
+    },
+    {
+      "key": "random/seed_8",
+      "kind": "method",
+      "state": "done",
+      "attempts": 1,
+      "rc": 0,
+      "last_error": ""
+    },
+    {
+      "key": "motpe/seed_8",
+      "kind": "method",
+      "state": "done",
+      "attempts": 1,
+      "rc": 0,
+      "last_error": ""
+    },
+    {
+      "key": "motpe_warm/seed_8",
+      "kind": "method",
+      "state": "done",
+      "attempts": 1,
+      "rc": 0,
+      "last_error": ""
+    },
+    {
+      "key": "agentic_cost/seed_9",
+      "kind": "method",
+      "state": "done",
+      "attempts": 2,
+      "rc": 0,
+      "last_error": "incomplete-after-exit0"
+    },
+    {
+      "key": "random/seed_9",
+      "kind": "method",
+      "state": "done",
+      "attempts": 1,
+      "rc": 0,
+      "last_error": ""
+    },
+    {
+      "key": "motpe/seed_9",
+      "kind": "method",
+      "state": "done",
+      "attempts": 1,
+      "rc": 0,
+      "last_error": ""
+    },
+    {
+      "key": "motpe_warm/seed_9",
+      "kind": "method",
+      "state": "done",
+      "attempts": 1,
+      "rc": 0,
+      "last_error": ""
+    },
+    {
+      "key": "agentic_cost/seed_10",
+      "kind": "method",
+      "state": "done",
+      "attempts": 2,
+      "rc": 0,
+      "last_error": "incomplete-after-exit0"
+    },
+    {
+      "key": "random/seed_10",
+      "kind": "method",
+      "state": "done",
+      "attempts": 1,
+      "rc": 0,
+      "last_error": ""
+    },
+    {
+      "key": "motpe/seed_10",
+      "kind": "method",
+      "state": "done",
+      "attempts": 1,
+      "rc": 0,
+      "last_error": ""
+    },
+    {
+      "key": "motpe_warm/seed_10",
+      "kind": "method",
+      "state": "done",
+      "attempts": 1,
+      "rc": 0,
+      "last_error": ""
+    },
+    {
+      "key": "finalize",
+      "kind": "finalize",
+      "state": "done",
+      "attempts": 0,
+      "rc": null,
+      "last_error": ""
+    }
+  ]
+}
